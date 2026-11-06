@@ -1,10 +1,24 @@
-# Shadow of the Colossus — Native Linux Port (Static Recompilation)
+<div align="center">
 
-A native Linux port of *Shadow of the Colossus* (PlayStation 2, PAL, `SCES-53326`) built with static
-recompilation. The game's MIPS R5900 code, its VU0 macro code and its VU1 micro programs are translated
-to C++ ahead of time and compiled into a normal Linux executable. There is no CPU emulation at runtime.
-Only the GS (graphics synthesizer) and SPU2 (sound) are rendered by PCSX2's renderer and audio core,
-linked in-process as a library, so the port gets a mature Vulkan renderer with internal upscaling for free.
+# Shadow of the Colossus — Native Linux Port
+
+**Static recompilation of the PS2 classic into a native Linux executable.**<br>
+No CPU emulation at runtime · bit-exact against the console reference · built to be remastered.
+
+[![Status](https://img.shields.io/badge/status-work%20in%20progress-orange)](#known-issues)
+[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-blue)](#building)
+[![Game](https://img.shields.io/badge/game-SCES--53326%20(PAL)-lightgrey)](#legal)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
+[![Renderer](https://img.shields.io/badge/renderer-PCSX2%20GS%20(Vulkan)-purple)](gsbridge/)
+[![Built with](https://img.shields.io/badge/built%20with-Claude%20%2B%20a%20human-black)](#how-this-was-built)
+
+<img src="docs/screenshots/shrine.png" width="860" alt="The Shrine of Worship, rendered by the native port at 3x internal resolution">
+
+<sub>Shrine of Worship — native port, PCSX2 GS renderer at 3× internal resolution, 50 FPS PAL / 60 FPS NTSC mode.</sub>
+
+</div>
+
+---
 
 > ⚠️ **Work in progress.** This is an active, fast-moving project, not a release. Expect rough edges,
 > missing features and breaking changes between commits. See [Known issues](#known-issues).
@@ -12,10 +26,28 @@ linked in-process as a library, so the port gets a mature Vulkan renderer with i
 **This repository contains no game code, no game assets and no BIOS.** You need your own disc. The
 pipeline in this repo turns *your* dump into *your* build on *your* machine (see [Legal](#legal)).
 
-> Status (November 2026): the game boots, plays from the intro into the open world, loads and saves,
-> and runs at the full frame rate of the selected video mode (50 Hz PAL / 60 Hz NTSC). Physics, camera
-> and animation were verified bit-for-bit against PCSX2 savestates on identical input recordings.
-> It is not finished — see [What's next](#whats-next).
+## At a glance
+
+| | | |
+|---|---|---|
+| 🧠 **How it runs** | The game's MIPS R5900 code, VU0 macro code and VU1 micro programs are translated to C++ ahead of time and compiled into an ordinary executable. | no interpreter, no JIT |
+| 🎨 **How it draws** | PCSX2's GS renderer and SPU2 are linked in-process as a library (Vulkan, internal upscaling, texture replacement). None of PCSX2's CPU emulation runs. | [`gsbridge/`](gsbridge/) |
+| 📏 **How it's checked** | Input recordings replay frame-exactly; RAM snapshots are compared word by word with PCSX2 savestates on the same route; three runs under full load are bit-identical. | [docs/VERIFICATION.md](docs/VERIFICATION.md) |
+| 🚀 **How fast** | One frame per VBlank — 50 FPS (PAL) / 60 FPS (NTSC mode) in the open world at 3× internal resolution. | [numbers](#numbers) |
+| 🔤 **How it looks sharp** | Menu/subtitle textures are re-typeset at 4× with real fonts — no AI upscaling. | [`tools/textseite_neu.py`](tools/textseite_neu.py) |
+
+### Status
+
+| Area | State | Notes |
+|---|---|---|
+| Boot, intro, title/language/60 Hz menus | ✅ | |
+| Open world, riding, climbing, save/load | ✅ | verified bit-exact vs. PCSX2 on recorded routes |
+| Sound & music (SPU2 + real IOP driver) | ✅ | |
+| Quit game / soft reset | ✅ / 🚧 | "New Game" from a running game untested |
+| Full-speed in colossus fights | 🚧 | VU1 is the bottleneck; stage-6 compiler in progress |
+| HD text | 🚧 | German pages of the intro/menus done, rest pending |
+| Settings menu, rumble, installer | ⬜ | planned |
+| Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
 
 ---
 
@@ -35,7 +67,7 @@ hardware documentation) and fixed at the root — in the recompiler, not with pe
 | **Multithreaded** | VIF1/VU1 work runs on a worker thread (like PCSX2's MTVU), the GS on its own thread. |
 | **HLE kernel without side effects** | The high-level kernel (threads, semaphores, SIF/RPC, memory card, CD) keeps all of its own state outside game RAM — an earlier layout clobbered the game heap and broke "Quit game". |
 | **Real IOP** | IRX modules are executed by an IOP emulator with its own RAM (sound driver, CD streaming), with HLE only where a module talks to real hardware. |
-| **HD text without AI** | Menu and subtitle textures are re-typeset: text lines are detected in the original textures, read with OCR, corrected, and re-rendered with free fonts at 4× resolution in the original layout. No AI upscaling ("AI slop") anywhere. |
+| **HD text without AI** | Menu and subtitle textures are re-typeset: text lines are detected in the original textures, read with OCR, corrected, and re-rendered with free fonts at 4× resolution in the original layout. No AI upscaling ("AI slop") anywhere. See the [before/after](#hd-text-before--after) below. |
 | **Input recording / replay** | Every bug report becomes a replay. The test harness runs dozens of replays in parallel, compares screenshots pixel-by-pixel across builds, and dumps RAM at chosen frames for comparison with PCSX2. |
 
 ### Correct vs. "looks right"
@@ -59,6 +91,13 @@ Some of the things that were found by comparing against the reference instead of
   puff until the game ran out of memory after ~8,700 frames.
 - The H-blank timer ran at NTSC speed on a PAL game; the PAL rate is 15625 Hz.
 - Interrupt handler stacks were placed on the game's main stack; HLE pools lived in game RAM.
+
+### HD text: before / after
+
+<div align="center">
+<img src="docs/screenshots/text_original_vs_retypeset.png" width="860" alt="Original texture text (left) vs re-typeset text (right): language menu, subtitle, tutorial box">
+<br><sub>Left: original 128–512 px texture pages as the game ships them. Right: the same pages re-typeset at 4× (TeX Gyre Heros / TeX Gyre Chorus), button icons kept from the original.</sub>
+</div>
 
 ---
 
@@ -89,21 +128,19 @@ The fixes live in this repository (`patches/`, `recomp/`) and are offered upstre
 
 ## Architecture
 
-```
-your disc image (ISO)
-   │  tools/extract_iso.py, scan_archive_xff.py
-   ▼
-loader ELF + KERNEL / MANAGER / GAMECORE modules (Team ICO "XFF" relocatable objects)
-   │  tools/link_sotc.py       → one statically linked ELF at fixed addresses
-   │  ps2_analyzer + ps2_recomp (PS2Recomp fork, recomp/)
-   ▼
-generated C++ for every game function  (never committed — generated on your machine)
-   │  tools/vu1dump.py + vu1rec.py   → VU1 micro programs → specialised C++/SSE
-   ▼
-ps2EntryRunner  =  generated code + ps2xRuntime (HLE kernel, IOP emulator, VIF/GIF, timing)
-   │
-   ├── libps2xgs.so  (PCSX2 GS renderer + SPU2, Vulkan, in-process, gsbridge/)
-   └── sotc_override.cpp  (game-specific runtime glue: CD file table, DECI2 console, diagnostics)
+```mermaid
+flowchart TD
+    ISO["🎮 your disc image (ISO)"] --> X["extract_iso.py · scan_archive_xff.py"]
+    X --> M["loader ELF + KERNEL / MANAGER / GAMECORE<br/>(Team ICO XFF relocatable objects)"]
+    M --> L["link_sotc.py<br/>one statically linked ELF at fixed addresses"]
+    L --> R["ps2_analyzer · ps2_recomp (PS2Recomp fork)"]
+    R --> G["generated C++ for every game function<br/><i>never committed — generated on your machine</i>"]
+    L --> V["vu1dump.py · vu1rec.py<br/>VU1 micro programs → specialised C++/SSE"]
+    G --> B["ps2EntryRunner"]
+    V --> B
+    RT["ps2xRuntime<br/>HLE kernel · IOP emulator · VIF/GIF · timing"] --> B
+    B -->|GIF / GS registers / SPU2| GS["libps2xgs.so<br/>PCSX2 GS (Vulkan) + SPU2, in-process"]
+    B --- O["sotc_override.cpp<br/>game glue: CD file table, DECI2, diagnostics"]
 ```
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [docs/VERIFICATION.md](docs/VERIFICATION.md).
