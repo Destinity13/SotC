@@ -1096,6 +1096,10 @@ def static_reach(pairs, seeds, modlen=0):
     def ok(pc):
         p = bypc.get(pc)
         return p is not None and not (p.uu.reserved or p.lu.reserved)
+    def crosses(a, b):
+        # Weiterlaufen ueber das Modulende hinaus: dahinter liegen Reste anderer Module (wechseln je nach Ladereihenfolge
+        # und geraeten sonst in die Signatur). Gezielte Spruenge in die gemeinsame Bibliothek (ab 0x2000) bleiben erlaubt.
+        return bool(modlen) and a < modlen <= b
     ret = set()
     for p in pairs:
         c = lower_ctrl(p)
@@ -1128,13 +1132,17 @@ def static_reach(pairs, seeds, modlen=0):
                 after = (pc + 16) & 0x3FFF
                 if c[0] == "static":
                     work.append(c[2])
-                    if c[1] not in ("B",):
+                    if c[1] not in ("B",) and not crosses(pc, after):
                         work.append(after)  # bedingt: nicht genommen; BAL: Ruecksprung
                 else:
                     if c[1] == "JALR":
                         work.append(after)
+                    # Ziel dynamisch: Ruecksprungadressen der Aufrufe innerhalb des Moduls (nicht die aus Speicherresten
+                    # oberhalb - die zogen sonst fremden Code in Uebersetzung und Signatur); ohne Modullaenge wie bisher
                     if not retAdded:
-                        work.extend(ret); retAdded = True
+                        work.extend(x for x in ret if not modlen or x - 16 < modlen); retAdded = True
+                break
+            if crosses(pc, slot):
                 break
             pc = slot
     # Vorsicht: nur behalten, was mit dem Mitschnitt verbunden ist (Seeds sind sicher ausgefuehrt worden)

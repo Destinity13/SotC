@@ -44,7 +44,7 @@ pipeline in this repo turns *your* dump into *your* build on *your* machine (see
 | Open world, riding, climbing, save/load | ✅ | verified bit-exact vs. PCSX2 on recorded routes |
 | Sound & music (SPU2 + real IOP driver) | ✅ | |
 | Quit game / soft reset | ✅ / 🚧 | "New Game" from a running game untested |
-| Full-speed in colossus fights | 🚧 | all 21 VU1 programs of the game are now compiled ahead of time (statically, from the game files); play-test pending |
+| Full-speed in colossus fights | 🚧 | all VU1 programs compiled ahead of time from the game files; 60 Hz confirmed in play (59.9 FPS open world); colossus fix in `pc157` awaiting the next play-test |
 | HD text | 🚧 | German pages of the intro/menus done, rest pending |
 | Settings menu, rumble, installer | ⬜ | planned |
 | Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
@@ -208,6 +208,10 @@ Honest list, as of early November 2026:
   there for the rest of the program (~8 M fallbacks in 10 minutes). Since `pc149` the interpreter jumps back
   into compiled code at the next block entry (checked bit-exact over 12.8 M invocations on a colossus replay),
   and the game records the missing code quietly while playing so the next build compiles it.
+- **Colossus frame drops after a few minutes (`pc154`).** The game reloaded a VU1 module with different leftovers
+  above it in micro memory; the static analysis had pulled those leftovers into the recognition signature (fall-through past
+  the module end, return addresses from stale code), so the module ran in the interpreter. Fixed in `pc157`: signatures
+  now cover only the module and the shared library at `0x2000+`.
 - **60 Hz mode stayed at 50 Hz** until `pc147`: the high-level `sceGsResetGraph` replacement never issued
   the `SetGsCrt` syscall, so the port missed the game's switch to NTSC timing. Fixed.
 - **Performance headroom in the open world:** the VU1 thread needs ≈ 11 ms per frame of the 16.7 ms budget at 60 Hz.

@@ -18,6 +18,8 @@ export PS2X_MTGS="${PS2X_MTGS:-1}"   # GS-Rasterizer im eigenen Thread (+56 %); 
 export PS2X_VU1_FAST="${PS2X_VU1_FAST:-1}"   # VU1 ohne long-double-Nachrechnung (bildgleich, ~7 % schneller)
 export PS2X_MTVU="${PS2X_MTVU:-1}"         # VIF1+VU1 auf eigenem Thread (wie PCSX2 MTVU)
 export PS2X_VU1_REC="${PS2X_VU1_REC:-1}"   # vorab uebersetzte VU1-Programme
+# Testlaeufe immer mit dem Referenz-Texturstand (9 Seiten Kantenformung, wie bei den pc126-Referenzbildern), nie mit dem HD-Text aus ~/.config
+export PS2XGS_TEXDIR="${PS2XGS_TEXDIR:-$ROOT/build/texturen}"
 export PS2X_VBLANK_HZ="${PS2X_VBLANK_HZ:-50}"   # PAL SCES-53326: 50 Hz wie PS2/PCSX2 (Partikel-Zeitschritt bitgleich 0.0196608); "60" fuer NTSC-Takt
 export SOTC_SKIP_VU1_NODRAW="${SOTC_SKIP_VU1_NODRAW:-1}"
 # EE-FPU wie PCSX2-Standard: Richtung null runden + Denormale als null (FPUFPCR-Default). "aus" = Wirtsstandard.

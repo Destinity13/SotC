@@ -314,9 +314,39 @@ def setze(name, img, font_path, aus, korr):
         ohne = [wb[3] for t, wb in ws if not (set(t) & UNTEN)]
         mit = [wb[3] for t, wb in ws if set(t) & UNTEN]
         grund = int(np.median(ohne)) * SKAL if ohne else int(np.median(mit)) * SKAL - desc
-        for t, wb in ws:
-            sf, rand = farben(arr, wb)
-            sw = max(1, SKAL // 2) if rand is not None else 0
+        # Eine Farbe je Zeile (Median ueber die Woerter): einzeln gemittelt kippten manche Woerter ins Lila
+        fz = [farben(arr, wb) for t, wb in ws]
+        sf_z = tuple(int(np.median([c[0][k] for c in fz])) for k in range(3))
+        rz = [c[1] for c in fz if c[1] is not None]
+        rand_z = tuple(int(np.median([c[k] for c in rz])) for k in range(3)) if len(rz) * 2 >= len(fz) else None
+        # Gleichmaessige Wortabstaende: Woerter in Lesereihenfolge von der linken Kante der Zeile an mit einem
+        # einheitlichen Abstand setzen (Originalpositionen schwankten durch die Erkennung: doppelte/fehlende Luecken).
+        # Ist die Zeile so breiter als im Original, alles gemeinsam stauchen; die Zeilenmitte bleibt.
+        ws = sorted(ws, key=lambda e: e[1][0])
+        sw0 = max(1, SKAL // 2) if rand_z is not None else 0
+        luecke = f.getlength(' ')
+        zh = max(wb[3] - wb[1] for t, wb in ws)
+        # Abschnitte: eine Luecke >= 0.8 Zeilenhoehe enthaelt ein Tastensymbol (bleibt im Original stehen) -> dort trennen
+        abschn = [[ws[0]]]
+        for prev, cur in zip(ws, ws[1:]):
+            if cur[1][0] - prev[1][2] >= 0.8 * zh:
+                abschn.append([cur])
+            else:
+                abschn[-1].append(cur)
+        ziel_x = []; stauche = []
+        for ab in abschn:
+            breiten = [f.getbbox(t, anchor='ls', stroke_width=sw0) for t, wb in ab]
+            z0, z1 = ab[0][1][0] * SKAL, ab[-1][1][2] * SKAL
+            gesamt = sum(bb_[2] - bb_[0] for bb_ in breiten) + luecke * (len(ab) - 1)
+            st = min(1.0, (z1 - z0) / gesamt) if gesamt > 0 else 1.0
+            # linksbuendig im Abschnitt, wenn er an ein Symbol grenzt, sonst mittig (Zeilenmitte bleibt)
+            x = z0 if len(abschn) > 1 else z0 + ((z1 - z0) - gesamt * st) / 2
+            for bb_ in breiten:
+                ziel_x.append(x); stauche.append(st)
+                x += ((bb_[2] - bb_[0]) + luecke) * st
+        for (t, wb), zx, stauch in zip(ws, ziel_x, stauche):
+            sf, rand = sf_z, rand_z
+            sw = sw0
             bb = f.getbbox(t, anchor='ls', stroke_width=sw)
             # Wort einzeln setzen; ist es breiter als die Originalbox, waagerecht stauchen (Höhe bleibt)
             tw, th = bb[2] - bb[0], bb[3] - bb[1]
@@ -326,10 +356,9 @@ def setze(name, img, font_path, aus, korr):
             if rand is not None:
                 wd.text(wpos, t, font=f, fill=rand + (255,), anchor='ls', stroke_width=sw, stroke_fill=rand + (255,))
             wd.text(wpos, t, font=f, fill=sf + (255,), anchor='ls')
-            maxw = (wb[2] - wb[0]) * SKAL + 2 * SKAL
-            if wimg.width > maxw:
-                wimg = wimg.resize((max(1, int(maxw)), wimg.height), Image.LANCZOS)
-            out.alpha_composite(wimg, (max(0, wb[0] * SKAL - 1), grund + bb[1] - 1))
+            if stauch < 0.999:
+                wimg = wimg.resize((max(1, int(wimg.width * stauch)), wimg.height), Image.LANCZOS)
+            out.alpha_composite(wimg, (max(0, int(zx) - 1), grund + bb[1] - 1))
     out.save(os.path.join(aus, name))
 
 
