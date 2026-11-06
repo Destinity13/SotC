@@ -184,6 +184,20 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [doc
 
 ---
 
+## Installing (Linux)
+
+After building (see below), one command adds the game to your desktop:
+
+```sh
+./tools/installieren.sh            # asks once for YOUR disc image, imports texture packs, adds menu entry + icon
+./tools/installieren.sh --entfernen   # remove menu entry/icon again (saves and settings stay)
+```
+
+- Texture packs in PCSX2 format (e.g. *Sad Origami*'s PAL remaster, `SCES-53326`) go into `texturpakete/` as the
+  archive you downloaded; the installer extracts them and the in-game **Textures** tab switches them on and off.
+- Optional ReShade-style effects via [vkBasalt](https://github.com/DadSchoorse/vkBasalt) (`sudo pacman -S vkbasalt`).
+- The icon is an original drawing, not a game asset.
+
 ## Building
 
 See [docs/BUILDING.md](docs/BUILDING.md). Short version (CachyOS / Arch):
