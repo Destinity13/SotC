@@ -2,7 +2,7 @@
 
 # Known issues
 
-An honest list, as of November 2026 (runtime build `pc164`).
+An honest list, as of November 2026 (runtime build `pc166`).
 
 ## Open
 
@@ -25,7 +25,7 @@ An honest list, as of November 2026 (runtime build `pc164`).
 - **Unit tests:** 435/446 pass. The 11 failures are test-bed assumptions (old CPU GS path, IOP heap address
   range, a VIF1 corner case that contradicts the hardware, VU1 flag tests that need `PS2X_VU1_FLAGS_ALWAYS=1`).
 - **PAL only.** NTSC-U/J would need a new module layout and a re-run of the whole pipeline.
-- No rumble yet. Windows is a separate, later project.
+- Windows is a separate, later project.
 
 ## Fixed (kept for the record)
 
@@ -36,5 +36,6 @@ An honest list, as of November 2026 (runtime build `pc164`).
 | `pc154` | all VU1 code compiled statically | modules read from the game files, reachability like PCSX2's microVU, 11 → 21 programs compiled |
 | `pc157` | colossus frame drops after a few minutes | stale code from previously loaded modules leaked into the program signatures; signatures now cover only the module and the shared library |
 | `pc163` | title menu at 39–54 FPS with a texture pack | PS2 alpha overshoot in the pack + replaced palette textures; see [PERFORMANCE.md](PERFORMANCE.md#texture-packs-making-them-fast) |
+| `pc166` | rumble and widescreen hooks lived inside generated code (lost on regeneration) | moved into `sotc_override.cpp`; rumble verified on the colossus replay (the game drives both motors, strength 0–255) |
 | `pc164` | warnings for syscalls 13/14 at boot | `SetVTLBRefillHandler` / `SetVCommonHandler` now behave like the BIOS (store per cause, return the previous handler) |
 | `pc163` | small per-call overhead in the VU1 path | an environment variable was read on every VU1 call; the play-time VU1 recording was on by default |

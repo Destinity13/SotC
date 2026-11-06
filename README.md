@@ -64,7 +64,7 @@ layout). Texture packs that ship their own text pages (all five languages) take 
 | **Verified, not eyeballed** | Player, camera and physics match PCSX2 on the same input recording; 10 translation bugs in the upstream recompiler were found this way and fixed. → [FINDINGS](docs/FINDINGS.md) |
 | **PCSX2's renderer, in-process** | Only the GS (Vulkan) and SPU2 come from PCSX2, linked as a library. None of its CPU emulation runs. → [`gsbridge/`](gsbridge/) |
 | **Texture packs at full speed** | PCSX2-format packs load directly. Two generic slowdowns in such packs (PS2 alpha overshoot, replaced palette textures) are fixed by tools that work for any game. → [PERFORMANCE](docs/PERFORMANCE.md#texture-packs-making-them-fast) |
-| **In-game menu** | Resolution, filtering, FXAA/CAS, texture packs, HD text and vkBasalt looks, switchable while playing. |
+| **In-game menu** | Resolution, filtering, FXAA/CAS, texture packs, HD text, vkBasalt looks and rumble strength, switchable while playing. |
 | **Linux installer** | Menu entry with icon, disc-image picker, texture-pack import. |
 
 ## Testing
@@ -76,7 +76,7 @@ Every change is checked against recorded play sessions and a reference emulator 
 | Automated jobs | **1,200+** through a job queue on the development machine (builds, replays, comparisons) |
 | Replay runs | **550+** headless runs of recorded sessions, **2.2 million frames** replayed (≈ 10 hours of gameplay at 60 FPS) |
 | Screenshots compared | **2,700+** pixel-by-pixel comparisons across builds; the standard regression set (36 frames, 3 routes) must stay bit-identical |
-| Runtime builds | **199** numbered builds (`pc1` … `pc164`), profile-guided |
+| Runtime builds | **200+** numbered builds (`pc1` … `pc166`), profile-guided |
 | VU1 equivalence | compiled VU1 vs. the cycle-accurate interpreter: 0 mismatches over **20 million** program invocations |
 | Reference runs | PCSX2 driven with the same recordings via a virtual pad; RAM snapshots compared field by field |
 | Recorded sessions | 12, from boot to the first colossus fight |
@@ -109,7 +109,7 @@ the VU1 thread is busy about half of the time. Details: [docs/PERFORMANCE.md](do
 | HD text | ✅ | pack text pages (all languages) first, own re-typeset German pages as fallback |
 | Settings menu, effects | 🚧 | graphics, textures, effects done |
 | Linux installer | 🚧 | works; polishing |
-| Rumble | ⬜ | planned |
+| Rumble | ✅ | both DualShock 2 motors forwarded to the gamepad; strength slider in the menu |
 | Windows | ⬜ | later, as a separate project |
 | NTSC-U/J | ⬜ | different module layout |
 
