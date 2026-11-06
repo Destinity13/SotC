@@ -28,3 +28,5 @@ texturen/
 __pycache__/
 *.pyc
 _to_delete/
+recomp/ps2xRuntime/include/ps2_recompiled_functions.h
+config/
