@@ -1,3 +1,4 @@
+#include <set>
 #include <immintrin.h>
 #include <mutex>
 #include <string>
@@ -1882,7 +1883,10 @@ namespace ps2x_vu1dump
     static void record(uint64_t hash, uint32_t pc, uint64_t cycles)
     {
         Val &v = g_map[Key{hash, pc}]; v.calls++; v.cycles += cycles;
-        if ((++g_calls & 2047u) != 0u) return;
+        // PS2X_VU1_DUMP_EVERY: Aufrufe zwischen zwei Schreibvorgaengen (Standard 2048 ~ 1 Bild; im Spielbetrieb
+        // z. B. 262144 ~ 2 min, damit das Mitschneiden beim Spielen keine Ruckler erzeugt)
+        static const uint64_t every = [] { const char *e = std::getenv("PS2X_VU1_DUMP_EVERY"); const unsigned long long n = (e && *e) ? std::strtoull(e, nullptr, 10) : 0ull; return n ? (uint64_t)n : 2048ull; }();
+        if ((++g_calls % every) != 0u) return;
         char path[512]; std::snprintf(path, sizeof(path), "%s/vu1_index.txt", dir());
         if (FILE *w = std::fopen(path, "w"))
         {
@@ -1904,6 +1908,7 @@ namespace ps2x_vu1dump
 
 
 extern const VU1Interpreter::CompiledEntry g_vu1CompiledTable[];
+extern const uint32_t g_vu1CompiledStatusIgnore; // Status-Bits, die die uebersetzten Programme nicht fuehren (ungelesen)
 extern const size_t g_vu1CompiledCount;
 static VU1Interpreter::CompiledFn vu1LookupCompiled(uint64_t hash)
 {
@@ -1988,7 +1993,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         else if (std::memcmp(a.acc, b.acc, sizeof(a.acc)) != 0) what = "ACC";
         else if (std::memcmp(&a.q, &b.q, 4) || std::memcmp(&a.p, &b.p, 4) || std::memcmp(&a.i, &b.i, 4) || a.r != b.r) what = "Q/P/I/R";
         else if (a.clip != b.clip) what = "CLIP";
-        else if (m_flagsLive && (a.mac != b.mac || a.status != b.status)) what = "MAC/STATUS";
+        else if (m_flagsLive && (a.mac != b.mac || ((a.status ^ b.status) & ~g_vu1CompiledStatusIgnore) != 0u)) what = "MAC/STATUS";
         else if (a.pc != b.pc) what = "PC";
         else if (capReal != capRef) what = "XGKICK-Daten";
         else if (std::memcmp(vuData, refData.data(), dataSize) != 0)
@@ -2073,6 +2078,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     const bool dumpCover = m_unit == Unit::VU1 && ps2x_vu1dump::dir() && memory && vuCode == memory->getVU1Code();
+    std::vector<uint8_t> *coverVec = nullptr; // einmal je Lauf nachschlagen statt je Befehlspaar
     // PS2X_VU1_REC=1: vorab uebersetzte Mikroprogramme benutzen (Abdeckungsluecken -> Interpreter)
     static const bool recOn = [] { const char *e = std::getenv("PS2X_VU1_REC"); return e && *e && *e != '0'; }();
     if (recOn && !dumpCover && !m_compiledDisabled && m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code())
@@ -2081,7 +2087,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (gen != m_recGen)
         {
             m_recGen = gen;
-            m_recFn = vu1LookupCompiled(ps2x_vu1dump::fnv(vuCode, codeSize));
+            const uint64_t recHash = ps2x_vu1dump::fnv(vuCode, codeSize);
+            m_recFn = vu1LookupCompiled(recHash);
+            if (!m_recFn)
+            {
+                // Unbekanntes Mikroprogramm laeuft komplett im Interpreter: einmal je Programm melden
+                static std::mutex s_m; static std::set<uint64_t> s_seen;
+                std::lock_guard<std::mutex> lk(s_m);
+                if (s_seen.insert(recHash).second)
+                    std::fprintf(stderr, "[VU1-Rec] unbekanntes Programm %016llx (Interpreter)\n", (unsigned long long)recHash);
+            }
         }
         if (m_recFn && m_recFn(*this, vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd, programEnded) == 0)
             goto vu1_run_epilogue;
@@ -2095,8 +2110,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         const DecodedInstructionPair &decoded = *decodedPairPtr(vuCode, codeSize, memory, m_state.pc);
         if (dumpCover)
         {
-            auto &cv = ps2x_vu1dump::g_cover[ps2x_vu1dump::g_lastHash];
-            if (m_state.pc / 8u < cv.size()) cv[m_state.pc / 8u] = 1u;
+            if (!coverVec) coverVec = &ps2x_vu1dump::g_cover[ps2x_vu1dump::g_lastHash];
+            if (m_state.pc / 8u < coverVec->size()) (*coverVec)[m_state.pc / 8u] = 1u;
         }
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {

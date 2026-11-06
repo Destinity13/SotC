@@ -42,6 +42,7 @@ FLAG_TARGET = "pipe"
 COVERED = set()
 STUFE3_OK = set()
 HEADS = set()
+NEED_STICKY = True
 SH = {}        # Stufe 6: Register mit gueltigem normalisierten Schatten sh[reg]
 SHA = [False]  # Stufe 6: ACC-Schatten gueltig
 LAST_FMAC = [None]  # (fd oder 'acc') des zuletzt ausgegebenen fmac6, sonst None
@@ -304,7 +305,7 @@ def upper_call5(U):
         if sp == 0x1D:  # ABS
             return [pre5, "abs5(v, %du, %du, %du);" % (ft, fs, D)]
         if sp == 0x1F:  # CLIP (Flag-Pipeline des Interpreters)
-            return [pre5, "clip5(v, cr, %du, %du);" % (fs, ft)]
+            return [pre5, "clip5(v, cr, cyc, %du, %du);" % (fs, ft)]
         toacc = 1
         if sp < 0x10:
             kind, src, bc = ["ADD", "SUB", "MADD", "MSUB"][sp >> 2], 0, sp & 3
@@ -366,7 +367,7 @@ def upper_call5(U):
             LAST_FMAC[0] = fd
         return lines
     return ["/* U %08x */" % U,
-            "fmac5<%d, %d, %d, %d>(v, fr, %du, %du, %du, %du, %du);" % (K[kind], src, toacc, live, fd, fs, ft, bc, REV4[dest])]
+            "fmac5<%d, %d, %d, %d, %d>(v, fr, cyc, %du, %du, %du, %du, %du);" % (K[kind], src, toacc, live, 1 if NEED_STICKY else 0, fd, fs, ft, bc, REV4[dest])]
 
 def sh_src(reg, lines):
     """normalisierter Vektor eines VF-Registers (Stufe 6): Schatten anlegen, falls noch keiner gilt"""
@@ -455,8 +456,8 @@ static inline __m128 vu5Norm(__m128 x)
     return _mm_castsi128_ps(r);
 }
 static const uint8_t kVu5Rev[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
-template <int K, int SRC, int TOACC, int LIVE>
-void VU1Interpreter::Compiled::fmac5(VU1Interpreter &v, FlagRing &fr, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm)
+template <int K, int SRC, int TOACC, int LIVE, int STICKY>
+void VU1Interpreter::Compiled::fmac5(VU1Interpreter &v, FlagRing &fr, uint64_t cyc, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm)
 {
     const __m128 s = vu5Norm(_mm_loadu_ps(v.m_state.vf[fs]));
     __m128 t;
@@ -486,8 +487,9 @@ void VU1Interpreter::Compiled::fmac5(VU1Interpreter &v, FlagRing &fr, uint32_t f
     if (!LIVE)
     {
         // Flags dieses Befehls liest statisch niemand (vor dem Lesen von einem spaeteren FMAC verdeckt): nur die
-        // Sticky-Bits nachfuehren, wie es das spaetere Eintragen getan haette.
-        if (v.m_flagsLive)
+        // Sticky-Bits nachfuehren, wie es das spaetere Eintragen getan haette. STICKY = 0: kein Programm liest
+        // die Sticky-Bits (FSAND/FSOR-Masken ohne 0xFC0, kein FSEQ) -> entfaellt (wie microVU-Flag-Analyse).
+        if (STICKY && v.m_flagsLive)
         {
             const uint32_t zm = (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(zero, und))) & dm;
             const uint32_t sm = (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(ri)) & dm;
@@ -505,7 +507,7 @@ void VU1Interpreter::Compiled::fmac5(VU1Interpreter &v, FlagRing &fr, uint32_t f
         const uint32_t om = (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(ovf)) & dm;
         const uint32_t mac = kVu5Rev[zm] | (kVu5Rev[sm] << 4) | (kVu5Rev[um] << 8) | (kVu5Rev[om] << 12);
         const uint32_t st = (zm ? 1u : 0u) | (sm ? 2u : 0u) | (um ? 4u : 0u) | (om ? 8u : 0u);
-        fr.push(v, v.m_cycle, mac, st);
+        fr.push(v, cyc, mac, st);
     }
     // nur die dest-Lanes schreiben
     const __m128i lm = _mm_set_epi32((dm & 8) ? -1 : 0, (dm & 4) ? -1 : 0, (dm & 2) ? -1 : 0, (dm & 1) ? -1 : 0);
@@ -554,7 +556,7 @@ void VU1Interpreter::Compiled::maxmin5(VU1Interpreter &v, uint32_t fd, uint32_t 
     vu5Write(v.m_state.vf[fd], ISMAX ? _mm_max_ps(s, t) : _mm_min_ps(s, t), dm);
 }
 // CLIP: wie execUpper (rohe Bits, nicht normalisiert), Ergebnis in die Flag-Pipeline des Interpreters
-void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, ClipRing &cr, uint32_t fs, uint32_t ft)
+void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, ClipRing &cr, uint64_t cyc, uint32_t fs, uint32_t ft)
 {
     uint32_t wBits; std::memcpy(&wBits, &v.m_state.vf[ft][3], 4);
     const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
@@ -567,7 +569,7 @@ void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, ClipRing &cr, uint32_t f
     }
     // wie queueClip: Arbeitswert schieben, Eintrag wird 4 Takte spaeter sichtbar (lokaler Ring statt Pipeline)
     v.m_workingClip = ((v.m_workingClip << 6) | (flags & 0x3Fu)) & 0xFFFFFFu;
-    cr.push(v, v.m_cycle, v.m_workingClip);
+    cr.push(v, cyc, v.m_workingClip);
 }
 '''
 
@@ -842,6 +844,22 @@ def main():
                 live = True
                 break
         progs.append((h, pairs, c, live))
+    # Liest irgendein Programm die Sticky-Status-Bits (0xFC0)? Der Status bleibt zwischen Programmen erhalten,
+    # deshalb ueber alle Programme. FSEQ vergleicht den ganzen Status -> braucht sie immer.
+    global NEED_STICKY
+    NEED_STICKY = False
+    for h, pairs, c, live in progs:
+        for p in pairs:
+            lo = p.lower
+            if lo >> 31:
+                continue
+            op = lo >> 25
+            imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7FF)
+            if op == 0x14 or (op in (0x16, 0x17) and (imm12 & 0xFC0)):
+                NEED_STICKY = True
+    if os.environ.get("VU1REC_STICKY") == "1":
+        NEED_STICKY = True  # erzwingen (A/B-Vergleich)
+    print("  Sticky-Status-Bits werden %s" % ("gefuehrt" if NEED_STICKY else "von keinem Programm gelesen -> entfallen"))
     global STUFE3_OK
     STUFE3_OK = set()
     if STUFE >= 3:
@@ -875,13 +893,13 @@ def main():
     w("{")
     w("    struct FlagRing;")
     if STUFE >= 5:
-        w("    template <int K, int SRC, int TOACC, int LIVE> static __attribute__((always_inline)) inline void fmac5(VU1Interpreter &v, FlagRing &fr, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm);")
+        w("    template <int K, int SRC, int TOACC, int LIVE, int STICKY> static __attribute__((always_inline)) inline void fmac5(VU1Interpreter &v, FlagRing &fr, uint64_t cyc, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm);")
         w("    template <int SH> static __attribute__((always_inline)) inline void itof5(VU1Interpreter &v, uint32_t ft, uint32_t fs, uint32_t dm);")
         w("    template <int SH> static __attribute__((always_inline)) inline void ftoi5(VU1Interpreter &v, uint32_t ft, uint32_t fs, uint32_t dm);")
         w("    static __attribute__((always_inline)) inline void abs5(VU1Interpreter &v, uint32_t ft, uint32_t fs, uint32_t dm);")
         w("    template <int ISMAX, int SRC> static __attribute__((always_inline)) inline void maxmin5(VU1Interpreter &v, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm);")
         w("    struct ClipRing;")
-        w("    static __attribute__((always_inline)) inline void clip5(VU1Interpreter &v, ClipRing &cr, uint32_t fs, uint32_t ft);")
+        w("    static __attribute__((always_inline)) inline void clip5(VU1Interpreter &v, ClipRing &cr, uint64_t cyc, uint32_t fs, uint32_t ft);")
     if STUFE >= 6:
         w("    template <int K, int LIVE> static __attribute__((always_inline)) inline __m128 fmac6(VU1Interpreter &v, FlagRing &fr, __m128 s, __m128 t, __m128 a, float *dst, uint32_t dm);")
     for h, pairs, c, live in progs:
@@ -937,6 +955,8 @@ def main():
         w("    {0ull, nullptr},")
     w("};")
     w("extern const size_t g_vu1CompiledCount = %d;" % len(progs))
+    w("// Sticky-Status-Bits (0xFC0) werden in den uebersetzten Programmen nicht gefuehrt, weil kein Programm sie liest:")
+    w("extern const uint32_t g_vu1CompiledStatusIgnore = 0x%03xu;" % (0 if NEED_STICKY else 0xFC0))
     open(outp, "w").write("\n".join(out) + "\n")
     print("%d Programme, %d Paare -> %s" % (len(progs), sum(len(p) for _, p, _, _ in progs), outp))
 
@@ -1335,6 +1355,23 @@ def gen_program3(h, pairs, out):
         for k in range(start, len(out)):
             if "fr.commitAll(v);" in out[k]:
                 out[k] = out[k].replace("fr.commitAll(v);", "fr.commitAll(v); cr.handBack(v);")
+        # Takt-Zaehler als lokale Variable (Register): Byte-Schreibzugriffe auf den VU-Speicher zwingen den Compiler
+        # sonst, v.m_cycle nach jedem Speichern neu zu laden. Zurueckgeschrieben wird vor jedem Aufruf, der m_cycle
+        # liest (commitReadyPipelines, queueQ, xgkickNow), und an jedem Ausgang.
+        for k in range(start, len(out)):
+            l = out[k]
+            if "FlagRing fr;" in l:
+                continue
+            l = l.replace("v.m_cycle", "cyc")
+            l = l.replace("v.commitReadyPipelines();", "{ v.m_cycle = cyc; v.commitReadyPipelines(); }")
+            l = l.replace("v.queueQ(", "v.m_cycle = cyc; v.queueQ(")
+            l = l.replace("v.xgkickNow(", "v.m_cycle = cyc; v.xgkickNow(")
+            l = l.replace("fr.commitAll(v);", "v.m_cycle = cyc; fr.commitAll(v);")
+            out[k] = l
+        for k in range(start, len(out)):
+            if out[k].strip() == "FlagRing fr;":
+                out[k] = out[k] + "\n    uint64_t cyc = v.m_cycle;"
+                break
 
 def _gen_program3(h, pairs, out):
     global HEADS
@@ -1404,7 +1441,7 @@ def _gen_program3(h, pairs, out):
         if STUFE < 4 or p.pc in entries:
             w("    case 0x%04x: goto M_%04x;" % (p.pc, p.pc))
     if STUFE >= 4:
-        w("    default: { static uint32_t s_miss = 0; if ((s_miss++ & 0x3FFu) == 0u) std::fprintf(stderr, \"[VU1-Rec] Einstieg %04x nicht vorgesehen (%u)\\n\", v.m_state.pc, s_miss); }")
+        w("    default: { static uint32_t s_miss = 0; if ((s_miss++ & 0x3FFu) == 0u) std::fprintf(stderr, \"[VU1-Rec] %s Einstieg %%04x nicht vorgesehen (%%u)\\n\", v.m_state.pc, s_miss); }" % h)
         w("             fr.commitAll(v); v.m_flagsLive = true; return 1;")
     else:
         w("    default: fr.commitAll(v); v.m_flagsLive = true; return 1;")

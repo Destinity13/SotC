@@ -44,7 +44,7 @@ pipeline in this repo turns *your* dump into *your* build on *your* machine (see
 | Open world, riding, climbing, save/load | ✅ | verified bit-exact vs. PCSX2 on recorded routes |
 | Sound & music (SPU2 + real IOP driver) | ✅ | |
 | Quit game / soft reset | ✅ / 🚧 | "New Game" from a running game untested |
-| Full-speed in colossus fights | 🚧 | VU1 is the bottleneck; stage-6 compiler in progress |
+| Full-speed in colossus fights | 🚧 | first colossus reached and fought natively; VU1 code coverage gaps there fall back to the interpreter (being closed) |
 | HD text | 🚧 | German pages of the intro/menus done, rest pending |
 | Settings menu, rumble, installer | ⬜ | planned |
 | Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
@@ -111,6 +111,9 @@ over 7.26 million VU1 program invocations** and 36/36 regression screenshots are
 | Remaining lower ops translated directly (DIV/RSQRT/SQRT/WAITQ, clip/status/MAC flag tests, MTIR/MFIR/ILWR/XTOP) — 389 interpreter fallbacks in the hot path → 0 | 76.7 s | −8 % |
 | Leaner bookkeeping: no upper-opcode tracking in the fast path, dominated "pending result" updates removed per block, branch-VI backup inline | 72.6 s | −13 % |
 | Cycle skipping to the next pipeline event; XGKICK copies whole GIF tag payloads instead of 16 bytes at a time | 70.1 s | −16 % |
+| Clip flags through a small in-block ring instead of the generic flag pipeline; VIF1 `UNPACK` specialised per format (no mask, CL/WL fast path — 176 M unpacks checked against the generic path) | 69.1 s | −17 % |
+| Profile-guided build of the above (`pc143`) | 63.1 s | −24 % |
+| Sticky status bits (`0xFC0`) dropped: a whole-program scan proves no VU1 program of this game ever reads them (all `FSAND` masks are `0x002`, `FMAND`/`FMEQ` read MAC, no `FCSET`) — without PGO | 59.0 s | **−29 %** |
 | Tried and rejected: a leaner FMAC core with normalised register shadows ("stage 6") — correct, but 8–15 % *slower* (code size / spills) | 89.8–95.6 s | ✗ |
 
 Measured with the thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`), solo, same replay, no PGO noise.
@@ -168,11 +171,11 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [doc
 | | |
 |---|---|
 | Project start | 1 November 2026 |
-| Builds | 170+ numbered runtime builds (`pc1` … `pc138`), with profile-guided optimisation |
+| Builds | 180+ numbered runtime builds (`pc1` … `pc148`), with profile-guided optimisation |
 | Test runs | 1,231 automated runs through the job queue (replays, differential VU1 tests, RAM comparisons, PCSX2 reference runs), up to 28 in parallel |
 | Reference comparisons | PCSX2 2.8.2 driven by a virtual game pad over PINE, savestates compared word by word |
 | Development machine | AMD Ryzen 9 7950X · AMD Radeon RX 7900 XT · CachyOS (Linux, KDE Plasma / Wayland) |
-| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution. Unpaced benchmark (5,500-frame open-world replay): **62.5 FPS**, VU1 thread **72 s CPU** — down from 83 s the same morning through four bit-exact compiler/runtime steps (see below) |
+| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution. Unpaced benchmark (5,500-frame open-world replay): **73.8 FPS** (`pc148`), VU1 thread **59.3 s CPU** — down from 83 s through bit-exact compiler/runtime steps (see below) |
 
 ---
 
@@ -197,9 +200,13 @@ The GS/SPU2 library is built once from a pinned PCSX2 commit with `gsbridge/` ap
 
 Honest list, as of early November 2026:
 
-- **Performance headroom is thin.** VU1 emulation takes up to ~14 ms per frame in the open world
-  (budget at 60 Hz: 16.7 ms). Colossus fights have not been profiled yet; frame drops there are likely
-  until the stage-6 VU1 compiler lands.
+- **Frame drops in the first colossus fight (25–38 FPS).** The first real play session reached and fought
+  the first colossus. From that area on, the game starts VU1 micro programs at entry points that never
+  appeared in our recordings, so those calls run in the slow cycle-accurate interpreter (~8 M fallbacks in
+  10 minutes). Builds now record unknown VU1 code quietly while playing, and the next build compiles it.
+- **60 Hz mode stayed at 50 Hz** until `pc147`: the high-level `sceGsResetGraph` replacement never issued
+  the `SetGsCrt` syscall, so the port missed the game's switch to NTSC timing. Fixed.
+- **Performance headroom in the open world:** the VU1 thread needs ≈ 11 ms per frame of the 16.7 ms budget at 60 Hz.
 - **"New Game" from inside a running game** (soft restart) is untested.
 - **HD text** covers only the pages seen so far (language select, title/bonus menus, 50/60 Hz notice,
   first tutorial boxes, first subtitles) and only German so far; other languages and later pages still
@@ -260,7 +267,7 @@ all switchable by environment variables and documented in `tools/run_game.sh`.
 - **VU1 compiler "stage 6"**: resolve pipeline stalls statically (as PCSX2's microVU does) so the
   per-instruction cycle bookkeeping disappears from the hot path; target is a comfortable 60 FPS margin
   in colossus fights at 3×–4× internal resolution.
-- Colossus-fight profiling (needs long input recordings).
+- Close the VU1 coverage gaps of the colossus fights (recorded automatically while playing), then profile them.
 - Remaining HD text pages (pause menu, options, later subtitles).
 - In-game settings menu (resolution, shaders, save browser), rumble, installer.
 

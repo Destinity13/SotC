@@ -802,6 +802,16 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
+            {
+                // Echtes libgraph ruft hier den Systemaufruf SetGsCrt (interlace, omode, ffmode). Ohne diesen
+                // Aufruf bemerkt PS2X_VBLANK_AUTO den 60-Hz-Wechsel aus dem SotC-Optionsmenue nie (blieb 50 Hz).
+                const __m128i a0 = ctx->r[4], a1 = ctx->r[5], a2 = ctx->r[6];
+                ctx->r[4] = _mm_set_epi64x(0, static_cast<int64_t>(interlace & 0x1u));
+                ctx->r[5] = _mm_set_epi64x(0, static_cast<int64_t>(omode & 0xFFu));
+                ctx->r[6] = _mm_set_epi64x(0, static_cast<int64_t>(ffmode & 0x1u));
+                ps2_syscalls::GsSetCrt(rdram, ctx, runtime);
+                ctx->r[4] = a0; ctx->r[5] = a1; ctx->r[6] = a2;
+            }
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);

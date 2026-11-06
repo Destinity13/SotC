@@ -25,7 +25,7 @@ for f in "$ROOT"/extracted/*; do
     ln -sfn "$f" "$RUN/$name"
 done
 cp -f "$ROOT/elf/sotc_linked.elf" "$RUN/SCES_533.26"
-BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc138}"   # aktuelle Binary (pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
+BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc148}"   # aktuelle Binary (pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
 if [ ! -x "$BIN" ] && [ -f "$BIN.xz" ]; then
     echo "==> Entpacke vorgebaute Binary"
     xz -dkf "$BIN.xz" && chmod +x "$BIN"
@@ -53,6 +53,13 @@ export PS2X_VBLANK_AUTO="${PS2X_VBLANK_AUTO:-1}"
 # Probleme mit "chop" (weisses Bild, Schweben) kamen von Wirts-Vergleichen mit PS2-MAX-Werten, seit pc105 behoben.
 export PS2X_EE_ROUND="${PS2X_EE_ROUND:-chop_daz}"
 export PS2X_VBLANK_HZ="${PS2X_VBLANK_HZ:-$HZ_INI}"   # PAL SCES-53326: 50 Hz wie PS2/PCSX2 (Partikel-Zeitschritt bitgleich 0.0196608); "60" fuer NTSC-Takt
+# VU1-Code mitschneiden, den der Uebersetzer noch nicht kennt (neue Gebiete/Kolosse): beim Spielen wird nur selten
+# geschrieben (alle ~2 min); die Daten fliessen in den naechsten Build ein (tools/vu1dump_merge.py).
+if [ -z "${PS2X_VU1_DUMP+x}" ]; then
+    export PS2X_VU1_DUMP="$ROOT/build/vu1dump_spiel"
+    export PS2X_VU1_DUMP_EVERY="${PS2X_VU1_DUMP_EVERY:-262144}"
+fi
+[ -n "$PS2X_VU1_DUMP" ] && mkdir -p "$PS2X_VU1_DUMP"
 export SOTC_MEMCARD="${SOTC_MEMCARD:-$ROOT/build/Mcd001.ps2}"
 # Speicherkarte: bei jedem Start eine Tageskopie (build/speicherkarten_sicherung/Mcd001_JJJJ-MM-TT.ps2)
 if [ -f "$SOTC_MEMCARD" ]; then

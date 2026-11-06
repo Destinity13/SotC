@@ -12,6 +12,8 @@ namespace sotc_vif_trace
 {
     std::atomic<uint64_t> g_op[128];
     std::atomic<uint64_t> g_calls{0}, g_bytes{0};
+    // UNPACK-Statistik je Format (vn<<2|vl): Vektoren im schnellen / allgemeinen Pfad, Gruende fuer den allgemeinen
+    std::atomic<uint64_t> g_unpFastVec[16], g_unpSlowVec[16], g_unpSlowMask{0}, g_unpSlowMode{0}, g_unpSlowCycle{0}, g_unpSlowV45{0};
     bool enabled()
     {
         static const bool on = std::getenv("SOTC_TRACE_VIF") != nullptr;
@@ -19,6 +21,13 @@ namespace sotc_vif_trace
     }
     void dump()
     {
+        std::fprintf(stderr, "[VIF1-UNPACK] langsam wegen Maske=%llu Modus=%llu CL!=WL=%llu V4-5=%llu; Vektoren schnell/langsam je Format:",
+                     (unsigned long long)g_unpSlowMask.load(), (unsigned long long)g_unpSlowMode.load(), (unsigned long long)g_unpSlowCycle.load(), (unsigned long long)g_unpSlowV45.load());
+        static const char *kFmt[16] = {"S-32","S-16","S-8","?","V2-32","V2-16","V2-8","?","V3-32","V3-16","V3-8","?","V4-32","V4-16","V4-8","V4-5"};
+        for (int i = 0; i < 16; ++i)
+            if (g_unpFastVec[i].load() || g_unpSlowVec[i].load())
+                std::fprintf(stderr, " %s:%llu/%llu", kFmt[i], (unsigned long long)g_unpFastVec[i].load(), (unsigned long long)g_unpSlowVec[i].load());
+        std::fprintf(stderr, "\n");
         std::fprintf(stderr, "[VIF1] calls=%llu bytes=%llu ops:", (unsigned long long)g_calls.load(), (unsigned long long)g_bytes.load());
         for (int i = 0; i < 128; ++i)
             if (g_op[i].load())
@@ -321,6 +330,87 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 }
 
 namespace { std::vector<uint8_t> g_vif1Carry; }
+
+// UNPACK ohne Maske (Format V2/V3/V4/S, 8/16/32 Bit): Skipping/Filling-Schreibweise (CL != WL) und MODE 1/2
+// (Offset/Differenz mit dem Row-Register) spezialisiert je Format. Bitgleich zur allgemeinen Schleife in
+// processVIF1Data (Felder jenseits der Komponenten behalten den alten Speicherwert und bekommen bei MODE 1/2
+// ebenfalls Row addiert; Fuellzyklen ohne Quelle schreiben Row).
+namespace
+{
+    template <int VL>
+    inline uint32_t vif1UnpackLoad(const uint8_t *sv, uint32_t c, bool zeroExtend)
+    {
+        if constexpr (VL == 0) { uint32_t w; std::memcpy(&w, sv + c * 4u, 4); return w; }
+        else if constexpr (VL == 1)
+        {
+            uint16_t raw; std::memcpy(&raw, sv + c * 2u, 2);
+            return zeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+        }
+        else
+        {
+            const uint8_t raw = sv[c];
+            return zeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+        }
+    }
+
+    template <int VL, int N>
+    void vif1UnpackNoMask(uint8_t *vu1Data, const uint8_t *srcBase, uint32_t bytesPerVector, uint32_t writeVectorCount,
+                          uint32_t sourceVectorCount, uint32_t vuAddr, uint32_t cl, uint32_t wl, bool zeroExtend,
+                          uint32_t mode, uint32_t *row)
+    {
+        const bool skipping = cl >= wl;
+        const bool addRow = (mode == 1u || mode == 2u);
+        uint32_t srcIndex = 0u, cp = 0u, blk = 0u;
+        for (uint32_t wi = 0; wi < writeVectorCount; ++wi)
+        {
+            const uint32_t destVec = (skipping ? (vuAddr + blk * cl + cp) : (vuAddr + wi)) & 0x3FFu;
+            uint8_t *dst = vu1Data + destVec * 16u;
+            if ((skipping || cp < cl) && srcIndex < sourceVectorCount)
+            {
+                const uint8_t *sv = srcBase + srcIndex * bytesPerVector;
+                ++srcIndex;
+                uint32_t d[4];
+                std::memcpy(d, dst, 16);
+                if constexpr (N == 1)
+                {
+                    const uint32_t v0 = vif1UnpackLoad<VL>(sv, 0u, zeroExtend);
+                    d[0] = d[1] = d[2] = d[3] = v0;
+                }
+                else
+                {
+                    for (uint32_t c = 0; c < static_cast<uint32_t>(N); ++c)
+                        d[c] = vif1UnpackLoad<VL>(sv, c, zeroExtend);
+                }
+                if (addRow)
+                {
+                    for (uint32_t f = 0; f < 4u; ++f)
+                    {
+                        d[f] += row[f];
+                        if (mode == 2u)
+                            row[f] = d[f];
+                    }
+                }
+                std::memcpy(dst, d, 16);
+            }
+            else
+                std::memcpy(dst, row, 16);
+            if (++cp == wl)
+            {
+                cp = 0u;
+                ++blk;
+            }
+        }
+    }
+
+    using Vif1UnpackFn = void (*)(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t *);
+    // Index (vn << 2) | vl; vl == 3 (V4-5) nicht hier
+    const Vif1UnpackFn kVif1UnpackNoMask[16] = {
+        vif1UnpackNoMask<0, 1>, vif1UnpackNoMask<1, 1>, vif1UnpackNoMask<2, 1>, nullptr,
+        vif1UnpackNoMask<0, 2>, vif1UnpackNoMask<1, 2>, vif1UnpackNoMask<2, 2>, nullptr,
+        vif1UnpackNoMask<0, 3>, vif1UnpackNoMask<1, 3>, vif1UnpackNoMask<2, 3>, nullptr,
+        vif1UnpackNoMask<0, 4>, vif1UnpackNoMask<1, 4>, vif1UnpackNoMask<2, 4>, nullptr,
+    };
+}
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
@@ -690,6 +780,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
             // Schneller Weg (wie PCSX2s vorab erzeugte Unpack-Routinen) fuer den Normalfall: keine Maske, MODE 0,
             // CL == WL (fortlaufend schreiben). Gleiches Ergebnis wie die allgemeine Schleife darunter.
+            if (sotc_vif_trace::enabled())
+            {
+                const bool fast = !maskEnable && (vif1_regs.mode & 3u) == 0u && cl == wl && vl != 3u;
+                (fast ? sotc_vif_trace::g_unpFastVec : sotc_vif_trace::g_unpSlowVec)[(vn << 2) | vl].fetch_add(writeVectorCount, std::memory_order_relaxed);
+                if (maskEnable) sotc_vif_trace::g_unpSlowMask.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                if ((vif1_regs.mode & 3u) != 0u) sotc_vif_trace::g_unpSlowMode.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                if (cl != wl) sotc_vif_trace::g_unpSlowCycle.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                if (vl == 3u) sotc_vif_trace::g_unpSlowV45.fetch_add(writeVectorCount, std::memory_order_relaxed);
+            }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable &&
                 (vif1_regs.mode & 3u) == 0u && cl == wl && vl != 3u)
             {
@@ -735,6 +834,30 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 if (pos > sizeBytes)
                     break;
                 continue;
+            }
+            // Spezialisierte Routinen fuer UNPACK ohne Maske (CL != WL und/oder MODE 1/2), siehe vif1UnpackNoMask
+            // PS2X_VIF_CHECK=1: Spezialroutine auf einer Kopie rechnen, dann die allgemeine Schleife, danach vergleichen
+            static const bool vifCheck = std::getenv("PS2X_VIF_CHECK") != nullptr;
+            static thread_local uint8_t chkMem[PS2_VU1_DATA_SIZE];
+            static thread_local uint32_t chkRow[4];
+            bool chkPending = false;
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && vl != 3u &&
+                kVif1UnpackNoMask[(vn << 2) | vl] != nullptr)
+            {
+                if (!vifCheck)
+                {
+                    kVif1UnpackNoMask[(vn << 2) | vl](m_vu1Data, data + pos, bytesPerVector, writeVectorCount, sourceVectorCount,
+                                                      vuAddr, cl, wl, zeroExtend, vif1_regs.mode & 3u, vif1_regs.row);
+                    pos += totalBytes;
+                    if (pos > sizeBytes)
+                        break;
+                    continue;
+                }
+                std::memcpy(chkMem, m_vu1Data, PS2_VU1_DATA_SIZE);
+                std::memcpy(chkRow, vif1_regs.row, sizeof(chkRow));
+                kVif1UnpackNoMask[(vn << 2) | vl](chkMem, data + pos, bytesPerVector, writeVectorCount, sourceVectorCount,
+                                                  vuAddr, cl, wl, zeroExtend, vif1_regs.mode & 3u, chkRow);
+                chkPending = true;
             }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
@@ -932,6 +1055,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
+            }
+            if (chkPending)
+            {
+                static std::atomic<uint64_t> s_n{0}, s_bad{0};
+                const bool bad = std::memcmp(chkMem, m_vu1Data, PS2_VU1_DATA_SIZE) != 0 || std::memcmp(chkRow, vif1_regs.row, sizeof(chkRow)) != 0;
+                const uint64_t n = s_n.fetch_add(1) + 1, nb = bad ? s_bad.fetch_add(1) + 1 : s_bad.load();
+                if (bad && nb <= 5)
+                    std::fprintf(stderr, "[VIF-CHECK] Abweichung: Format vn=%u vl=%u cl=%u wl=%u mode=%u num=%u\n", vn, vl, cl, wl, vif1_regs.mode & 3u, writeVectorCount);
+                if ((n & 0xFFFFFu) == 0u)
+                    std::fprintf(stderr, "[VIF-CHECK] %llu UNPACKs geprueft, %llu Abweichungen\n", (unsigned long long)n, (unsigned long long)nb);
             }
             pos += totalBytes;
 

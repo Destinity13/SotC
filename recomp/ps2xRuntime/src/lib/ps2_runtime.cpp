@@ -1658,6 +1658,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         std::lock_guard<std::mutex> lock(g_ps2xCallHistMutex);
         ++g_ps2xCallHist[targetPc];
     }
+    // Alle Sprung-Diagnosen (PS2X_SPCHECK_*, PS2X_CALLRING, PS2X_TRACE_BRANCH_TARGET) hinter einem Schalter:
+    // im Normalbetrieb eine einzige vorhersagbare Abfrage statt sechs je Funktionsaufruf.
+    static const bool s_branchDiag = std::getenv("PS2X_SPCHECK_LO") || std::getenv("PS2X_CALLRING") || std::getenv("PS2X_TRACE_BRANCH_TARGET");
+    if (__builtin_expect(s_branchDiag, 0))
+    {
     {
         // SotC diagnostics: stack consistency for calls made from inside a watched function range.
         static const uint32_t rangeLo = [] { const char *e = std::getenv("PS2X_SPCHECK_LO"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
@@ -1723,6 +1728,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             }
         }
     }
+    } // s_branchDiag
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -1745,7 +1751,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    uint32_t targetSlot = 0u;
+    RecompiledFunction targetFn = generatedFunctionTableSlot(targetPc, targetSlot) ? g_ps2RecompiledFunctionTable[targetSlot] : nullptr;
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1767,7 +1775,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc); // wie lookupFunction (Absturz-Protokoll)
     const uint32_t entryPc = ctx->pc;
     static const bool spReturnCheck = std::getenv("PS2X_SP_RETURN_CHECK") != nullptr;
     const uint32_t spBeforeCall = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
