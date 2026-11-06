@@ -817,6 +817,7 @@ def main():
     for line in open(os.path.join(d, "vu1_index.txt")):
         h, pc, calls, c = line.split()
         cyc[h] += int(c)
+        START_PCS.setdefault(h, set()).add(int(pc, 16))
     tot = sum(cyc.values()) or 1
     progs = []
     for h, c in cyc.most_common():
@@ -957,6 +958,18 @@ def main():
     w("extern const size_t g_vu1CompiledCount = %d;" % len(progs))
     w("// Sticky-Status-Bits (0xFC0) werden in den uebersetzten Programmen nicht gefuehrt, weil kein Programm sie liest:")
     w("extern const uint32_t g_vu1CompiledStatusIgnore = 0x%03xu;" % (0 if NEED_STICKY else 0xFC0))
+    # Einstiegskarten: der Interpreter springt nach einem Rueckfall am naechsten Einstieg zurueck in den uebersetzten Code
+    for h, pairs, c, live in progs:
+        bits = [0] * 2048
+        for e in ENTRY_MAPS.get(h, ()):
+            bits[e // 8] = 1
+        w("static const uint8_t s_entry_%s[2048] = {%s};" % (h, ",".join(str(b) for b in bits)))
+    w("extern const uint8_t *vu1CompiledEntryMap(uint64_t hash)")
+    w("{")
+    for h, pairs, c, live in progs:
+        w("    if (hash == 0x%sull) return s_entry_%s;" % (h, h))
+    w("    return nullptr;")
+    w("}")
     open(outp, "w").write("\n".join(out) + "\n")
     print("%d Programme, %d Paare -> %s" % (len(progs), sum(len(p) for _, p, _, _ in progs), outp))
 
@@ -1107,6 +1120,8 @@ DEAD_FLAGS = set()
 CUR_PC = -1
 ENTRIES5 = set()
 BACKUP_SETTERS = set()
+START_PCS = {}  # hash -> Startadressen (vu1_index.txt)
+ENTRY_MAPS = {}  # hash -> Einstiege (fuer den Wiedereinstieg aus dem Interpreter)
 
 def needs_vf0_reset(d):
     """Muss nach dem Paar vf0/vi0 wiederhergestellt werden? Nur wenn es (moeglicherweise) dorthin schreibt."""
@@ -1391,7 +1406,7 @@ def _gen_program3(h, pairs, out):
             prev[slot] = ("dyn",)
         elif p.eBit:
             prev[slot] = ("end",)
-    entries = set(HEADS) | {0}
+    entries = set(HEADS) | {0} | {x for x in START_PCS.get(h, ()) if x in cov}
     exits = set()
     bypc = {p.pc: p for p in pairs}
     for p in pairs:
@@ -1414,6 +1429,7 @@ def _gen_program3(h, pairs, out):
     if STUFE >= 5:
         analyse_recpend(pairs, entries, exits)
     ENTRIES5.clear(); ENTRIES5.update(entries)
+    ENTRY_MAPS[h] = sorted(e for e in entries if e in cov) if STUFE >= 4 else sorted(cov)
     BACKUP_SETTERS.clear()
     for p in pairs:
         Wp = next((r for r in range(1, 16) if p.lu.viWrite & (1 << r)), 0)

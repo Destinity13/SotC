@@ -270,6 +270,8 @@ private:
         reportReservedInstruction(true, 0xFFFFFFFFu);
     } // uebersetzte Programme schreiben sofort: spaetester Zyklus, bis zu dem der Interpreter noch Schreibvorgaenge in der Warteschlange haette
     CompiledFn m_recFn = nullptr;
+    const uint8_t *m_recEntry = nullptr; // Einstiegskarte des uebersetzten Programms (je Paar 1 Byte)
+    uint32_t m_recSkipPc = ~0u;          // dort ist der Wiedereinstieg gerade gescheitert
     void dumpDecoded(const uint8_t *vuCode, uint32_t codeSize, const char *path) const;
     bool m_flagsLive = true; // Mikroprogramm liest MAC/Status (FS*/FM*)? Sonst Flag-Pipeline sparen
 

@@ -200,10 +200,12 @@ The GS/SPU2 library is built once from a pinned PCSX2 commit with `gsbridge/` ap
 
 Honest list, as of early November 2026:
 
-- **Frame drops in the first colossus fight (25–38 FPS).** The first real play session reached and fought
-  the first colossus. From that area on, the game starts VU1 micro programs at entry points that never
-  appeared in our recordings, so those calls run in the slow cycle-accurate interpreter (~8 M fallbacks in
-  10 minutes). Builds now record unknown VU1 code quietly while playing, and the next build compiles it.
+- **Frame drops in the first colossus fight (25–38 FPS, `pc148` and older).** The first real play session
+  reached and fought the first colossus. From that area on, VU1 micro programs hit code paths that never
+  appeared in our recordings; the compiled program fell back to the cycle-accurate interpreter and stayed
+  there for the rest of the program (~8 M fallbacks in 10 minutes). Since `pc149` the interpreter jumps back
+  into compiled code at the next block entry (checked bit-exact over 12.8 M invocations on a colossus replay),
+  and the game records the missing code quietly while playing so the next build compiles it.
 - **60 Hz mode stayed at 50 Hz** until `pc147`: the high-level `sceGsResetGraph` replacement never issued
   the `SetGsCrt` syscall, so the port missed the game's switch to NTSC timing. Fixed.
 - **Performance headroom in the open world:** the VU1 thread needs ≈ 11 ms per frame of the 16.7 ms budget at 60 Hz.

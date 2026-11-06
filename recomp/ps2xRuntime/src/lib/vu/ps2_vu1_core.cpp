@@ -1867,7 +1867,7 @@ namespace ps2x_vu1dump
     static uint64_t g_lastGen = ~0ull, g_lastHash = 0, g_calls = 0;
     static bool g_lastNew = false;
     static std::map<uint64_t, std::vector<uint8_t>> g_cover; // hash -> ausgefuehrte Paare (pc/8)
-    static const char *dir() { static const char *d = [] { const char *e = std::getenv("PS2X_VU1_DUMP"); return (e && *e) ? e : nullptr; }(); return d; }
+    static const char *dir() { static const char *d = [] { const char *e = std::getenv("PS2X_VU1_DUMP"); if (e && *e) { std::error_code ec; std::filesystem::create_directories(e, ec); } return (e && *e) ? e : nullptr; }(); return d; }
     static uint64_t fnv(const uint8_t *p, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; } return h; }
     static uint64_t codeHash(const uint8_t *code, uint32_t size, uint64_t gen)
     {
@@ -1910,6 +1910,7 @@ namespace ps2x_vu1dump
 extern const VU1Interpreter::CompiledEntry g_vu1CompiledTable[];
 extern const uint32_t g_vu1CompiledStatusIgnore; // Status-Bits, die die uebersetzten Programme nicht fuehren (ungelesen)
 extern const size_t g_vu1CompiledCount;
+extern const uint8_t *vu1CompiledEntryMap(uint64_t hash);
 static VU1Interpreter::CompiledFn vu1LookupCompiled(uint64_t hash)
 {
     for (size_t i = 0; i < g_vu1CompiledCount; ++i)
@@ -2081,7 +2082,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     std::vector<uint8_t> *coverVec = nullptr; // einmal je Lauf nachschlagen statt je Befehlspaar
     // PS2X_VU1_REC=1: vorab uebersetzte Mikroprogramme benutzen (Abdeckungsluecken -> Interpreter)
     static const bool recOn = [] { const char *e = std::getenv("PS2X_VU1_REC"); return e && *e && *e != '0'; }();
-    if (recOn && !dumpCover && !m_compiledDisabled && m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code())
+    // Mitschnitt (dumpCover) und Uebersetzer zusammen: der Interpreter zeichnet dann genau die Abdeckungsluecken auf
+    if (recOn && !m_compiledDisabled && m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code())
     {
         const uint64_t gen = memory->getVU1CodeGeneration();
         if (gen != m_recGen)
@@ -2089,6 +2091,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             m_recGen = gen;
             const uint64_t recHash = ps2x_vu1dump::fnv(vuCode, codeSize);
             m_recFn = vu1LookupCompiled(recHash);
+            m_recEntry = m_recFn ? vu1CompiledEntryMap(recHash) : nullptr;
+            m_recSkipPc = ~0u;
             if (!m_recFn)
             {
                 // Unbekanntes Mikroprogramm laeuft komplett im Interpreter: einmal je Programm melden
@@ -2106,6 +2110,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
+        // Nach einem Rueckfall (Abdeckungsluecke) am naechsten Einstieg zurueck in den uebersetzten Code, statt das
+        // restliche Programm im Interpreter zu rechnen. Gleiche Bedingungen wie der Einstieg im uebersetzten Code.
+        if (m_recEntry && !m_compiledDisabled && m_state.pc != m_recSkipPc && m_recEntry[(m_state.pc & 0x3FFFu) >> 3] &&
+            !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot && !hasPendingRegWrites())
+        {
+            const uint32_t pcBefore = m_state.pc;
+            if (m_recFn(*this, vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd, programEnded) == 0)
+                goto vu1_run_epilogue;
+            m_recSkipPc = (m_state.pc == pcBefore) ? pcBefore : ~0u;
+            continue;
+        }
 
         const DecodedInstructionPair &decoded = *decodedPairPtr(vuCode, codeSize, memory, m_state.pc);
         if (dumpCover)
