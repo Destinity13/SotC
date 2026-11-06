@@ -25,7 +25,7 @@ for f in "$ROOT"/extracted/*; do
     ln -sfn "$f" "$RUN/$name"
 done
 cp -f "$ROOT/elf/sotc_linked.elf" "$RUN/SCES_533.26"
-BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc157}"   # aktuelle Binary (pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
+BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc158}"   # aktuelle Binary (pc158: Spielprofil je Minute; pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
 if [ ! -x "$BIN" ] && [ -f "$BIN.xz" ]; then
     echo "==> Entpacke vorgebaute Binary"
     xz -dkf "$BIN.xz" && chmod +x "$BIN"
@@ -66,6 +66,14 @@ if [ "${SOTC_HD_TEXT:-1}" = 1 ] && [ -z "${PS2XGS_TEXDIR:-}" ]; then
     _hd_src="$ROOT/build/texturen/neusatz_ersatz_de/SCES-53326/replacements"
     _hd_dst="${XDG_CONFIG_HOME:-$HOME/.config}/sotc-recomp/texturen/SCES-53326/replacements"
     if [ -d "$_hd_src" ]; then mkdir -p "$_hd_dst" && cp -u "$_hd_src"/*.png "$_hd_dst"/ 2>/dev/null || true; fi
+fi
+# Laufzeitprofil beim Spielen (Stichprobe alle 2 ms CPU-Zeit, kaum messbare Last): jede Minute ein Zwischenstand in
+# build/spiel_profil/<start>/ -> tools/profil_minute.py zeigt, wo in einer bestimmten Spielminute die Zeit hingeht.
+# Abschalten: SOTC_PROFILE=
+if [ -z "${SOTC_PROFILE+x}" ]; then
+    export SOTC_PROFILE=2000 SOTC_PROFILE_MINUTEN=1
+    export SOTC_PROFILE_DIR="$ROOT/build/spiel_profil/$(date +%F_%H%M)"
+    mkdir -p "$SOTC_PROFILE_DIR"; echo "$BIN" > "$SOTC_PROFILE_DIR/binary.txt"
 fi
 export SOTC_MEMCARD="${SOTC_MEMCARD:-$ROOT/build/Mcd001.ps2}"
 # Speicherkarte: bei jedem Start eine Tageskopie (build/speicherkarten_sicherung/Mcd001_JJJJ-MM-TT.ps2)

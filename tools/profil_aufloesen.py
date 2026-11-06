@@ -12,7 +12,11 @@ def load_syms(path, dynamic=False):
     out = []
     for args in ([['nm', '-C', '-S', '--defined-only', path]] + ([['nm', '-C', '-S', '-D', '--defined-only', path]] if dynamic else [])):
         try:
-            txt = subprocess.run(args, capture_output=True, text=True).stdout
+            # Spieler-Binaries sind gestrippt: ihre Symboltabelle liegt als build/sotc/symbole/<name>.nm daneben
+            nmf = os.path.join(os.path.dirname(path), 'symbole', os.path.basename(path) + '.nm')
+            if path.endswith('.nm'): txt = open(path).read()
+            elif args[-1] == path and '-D' not in args and os.path.exists(nmf): txt = open(nmf).read()
+            else: txt = subprocess.run(args, capture_output=True, text=True).stdout
         except OSError:
             continue
         for line in txt.splitlines():
