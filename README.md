@@ -44,7 +44,8 @@ pipeline in this repo turns *your* dump into *your* build on *your* machine (see
 | Open world, riding, climbing, save/load | ✅ | verified bit-exact vs. PCSX2 on recorded routes |
 | Sound & music (SPU2 + real IOP driver) | ✅ | |
 | Quit game / soft reset | ✅ / 🚧 | "New Game" from a running game untested |
-| Full-speed in colossus fights | 🚧 | all VU1 programs compiled ahead of time from the game files; 60 Hz confirmed in play (59.9 FPS open world); colossus fix in `pc157` awaiting the next play-test |
+| First colossus | ✅ | **fought and defeated natively** (`pc157`, 60 Hz mode), in-game save works |
+| Full-speed in colossus fights | 🚧 | mostly 60 FPS; heavy moments dip to ~46–55 FPS (VU1 load, not coverage) |
 | HD text | 🚧 | German pages of the intro/menus done, rest pending |
 | Settings menu, rumble, installer | ⬜ | planned |
 | Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
