@@ -1,0 +1,6 @@
+# ps2x-gsbridge: PCSX2-GS als gemeinsame Bibliothek fuer SotC Recomp (nur ps2xgs_* exportiert)
+add_library(ps2xgs SHARED Bridge.cpp)
+target_include_directories(ps2xgs PRIVATE "${CMAKE_BINARY_DIR}/common/include" "${CMAKE_SOURCE_DIR}/pcsx2")
+target_link_libraries(ps2xgs PRIVATE PCSX2_FLAGS PCSX2 SDL3::SDL3 X11)
+set_target_properties(ps2xgs PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+target_link_options(ps2xgs PRIVATE "-Wl,--exclude-libs,ALL")

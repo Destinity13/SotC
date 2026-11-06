@@ -1,0 +1,1811 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..927aded 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -107,6 +107,8 @@ namespace ps2x::iop::detail
+             if (m_currentThread != nullptr)
+             {
+                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
++                if (ordinal == 9)
++                    m_hasDeadThreads = true;
+                 cpu.stopped = true;
+                 cpu.yielded = true;
+             }
+@@ -671,15 +673,18 @@ namespace ps2x::iop::detail
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        for (auto &[id, thread] : m_threads)
+-        {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
+-        }
+-
++        // One pass: wake expired delays and pick the best ready thread (same result as two passes).
+         IopThread *next = nullptr;
++        uint64_t earliestWake = UINT64_MAX;
+         for (auto &[id, thread] : m_threads)
+         {
++            if (thread.state == IopThreadState::Delay)
++            {
++                if (thread.wakeCycle <= currentCycle)
++                    thread.state = IopThreadState::Ready;
++                else
++                    earliestWake = std::min(earliestWake, thread.wakeCycle);
++            }
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+             if (next == nullptr || thread.priority < next->priority ||
+@@ -687,7 +692,12 @@ namespace ps2x::iop::detail
+                 next = &thread;
+         }
+         if (next == nullptr)
++        {
++            // Nothing ran, so no thread state changes before nextWakeCycle(): reuse this pass.
++            m_cachedWake = earliestWake;
++            m_cachedWakeValid = true;
+             return nullptr;
++        }
+ 
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+@@ -698,6 +708,11 @@ namespace ps2x::iop::detail
+ 
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
++        if (m_cachedWakeValid)
++        {
++            m_cachedWakeValid = false;
++            return std::min(fallback, m_cachedWake);
++        }
+         uint64_t nextWake = fallback;
+         for (const auto &[id, thread] : m_threads)
+         {
+@@ -719,6 +734,9 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
++        if (!m_hasDeadThreads)
++            return;
++        m_hasDeadThreads = false;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -738,7 +756,10 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+             if (pc >= base && pc < base + size)
++            {
+                 thread.state = IopThreadState::Dead;
++                m_hasDeadThreads = true;
++            }
+         }
+     }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..96c9df1 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -93,6 +93,9 @@ namespace ps2x::iop::detail
+ 
+         IopMemory &m_memory;
+         std::map<int, IopThread> m_threads;
++        bool m_hasDeadThreads = false;
++        mutable bool m_cachedWakeValid = false;
++        uint64_t m_cachedWake = 0;
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         uint32_t m_nextThreadId = 1;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..14afcd0 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -299,7 +299,10 @@ namespace ps2x::iop::detail
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
++        // First fit from the heap base so freed blocks are reused (the previous bump cursor
++        // never handed freed memory out again and exhausted the 832 KB heap, e.g. Shadow of the
++        // Colossus' 352 KB ADPCM stream buffer after its IRX upload buffers were freed).
++        uint32_t candidate = alignUp(HeapBase, alignment);
+         for (;;)
+         {
+             bool overlap = false;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..53eef06 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -22,7 +22,7 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        static constexpr uint32_t HeapBase = 0x000A0000u; // was 0x120000: real IOP RAM is 2 MB; SotC needs 3x352 KB ADPCM buffers
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xRecomp/include/ps2recomp/Translators/instruction_translator.h b/ps2xRecomp/include/ps2recomp/Translators/instruction_translator.h
+index c45cd07..19f0478 100644
+--- a/ps2xRecomp/include/ps2recomp/Translators/instruction_translator.h
++++ b/ps2xRecomp/include/ps2recomp/Translators/instruction_translator.h
+@@ -14,7 +14,8 @@ namespace ps2recomp
+     {
+     public:
+         explicit InstructionTranslator(CodeGenerator &codeGenerator);
+-        std::string translate(const Instruction &inst, const MemoryAccessHint &memoryHint);
++        std::string translate(const Instruction &inst, const MemoryAccessHint &memoryHint, bool allowDynamic = true);
++        std::string translateDynamicImmediate(const Instruction &inst);
+ 
+     private:
+         MemoryAccessHint effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const;
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+index 1bdf0f6..ca04cdf 100644
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -55,6 +55,8 @@ namespace ps2recomp
+         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
+         void setEmitInstructionComments(bool emitInstructionComments);
+         void setReporter(RecompilerReporter *reporter);
++        void setDynamicImmediates(const std::unordered_set<uint32_t> &addresses) { m_dynamicImmediates = addresses; }
++        bool isDynamicImmediate(uint32_t address) const { return m_dynamicImmediates.count(address) != 0; }
+ 
+         AnalysisResult collectInternalBranchTargets(const Function &function,
+                                                   const std::vector<Instruction> &instructions,
+@@ -68,6 +70,7 @@ namespace ps2recomp
+         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
+         const std::vector<Section>& m_sections;
+         BootstrapInfo m_bootstrapInfo;
++        std::unordered_set<uint32_t> m_dynamicImmediates;
+         bool m_emitInstructionComments = true;
+         RecompilerReporter *m_reporter = nullptr;
+         std::string m_currentFunctionName;
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+index 9bd687d..5f12a7a 100644
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -5,6 +5,7 @@
+ #include <vector>
+ #include <cstdint>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <map>
+ 
+ namespace ps2recomp
+@@ -190,6 +191,10 @@ namespace ps2recomp
+         std::vector<std::string> entryPointHints;
+         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
+         std::vector<JumpTable> jumpTables;
++        // Instruction addresses whose 16-bit immediate is patched by the game at runtime
++        // (e.g. a dynamic linker resolving data symbols). Their immediates are read live
++        // from guest memory instead of being baked into the generated code.
++        std::unordered_set<uint32_t> dynamicImmediates;
+     };
+ 
+ } // namespace ps2recomp
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+index 97dc2dd..bcb51e5 100644
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -166,6 +166,21 @@ namespace ps2recomp
+                 }
+             }
+ 
++            if (data.contains("dynamic_immediates") && data.at("dynamic_immediates").is_table())
++            {
++                const auto &dynTable = toml::find(data, "dynamic_immediates");
++                if (dynTable.contains("addresses") && dynTable.at("addresses").is_array())
++                {
++                    for (const auto &value : dynTable.at("addresses").as_array())
++                    {
++                        if (value.is_integer())
++                            config.dynamicImmediates.insert(static_cast<uint32_t>(value.as_integer()));
++                        else if (value.is_string())
++                            config.dynamicImmediates.insert(static_cast<uint32_t>(std::stoul(value.as_string(), nullptr, 0)));
++                    }
++                }
++            }
++
+             if (data.contains("jump_tables") && data.at("jump_tables").is_table())
+             {
+                 const auto &jumpTablesNode = data.at("jump_tables");
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+index 3192e90..b4792a2 100644
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -197,12 +197,18 @@ namespace ps2recomp
+                         }
+ 
+                         updateConstantRegisters(inst, constantRegisters);
++                        if (cg.isDynamicImmediate(inst.address))
++                            constantRegisters.invalidate(inst.rt);
+                         continue;
+                     }
+ 
+                     ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+                        << std::dec;
+-                    const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
++                    // A dynamic-immediate site is relocated by the game at runtime: never fold its
++                    // link-time immediate into a constant address.
++                    const MemoryAccessHint memoryHint = cg.isDynamicImmediate(inst.address)
++                                                            ? MemoryAccessHint{}
++                                                            : resolveMemoryAccessHint(inst, constantRegisters);
+                     ss << "    " << cg.translateInstruction(inst, memoryHint);
+                     if (inst.isMmio)
+                     {
+@@ -211,6 +217,8 @@ namespace ps2recomp
+                     ss << "\n";
+ 
+                     updateConstantRegisters(inst, constantRegisters);
++                    if (cg.isDynamicImmediate(inst.address))
++                        constantRegisters.invalidate(inst.rt);
+                 }
+             }
+             catch (const std::exception &e)
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 7684097..9f6760e 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -62,6 +62,37 @@ namespace ps2recomp
+         }
+     }
+ 
++    std::string InstructionTranslator::translateDynamicImmediate(const Instruction &inst)
++    {
++        // Translate with sentinel immediates, then swap them for live reads of the
++        // instruction word, so the game's own runtime relocation of this word is honoured.
++        static constexpr uint32_t kSentinelS = 0x5A5A5A5Au;
++        static constexpr uint32_t kSentinelU = 0x5A5A5A5Bu;
++        Instruction probe = inst;
++        probe.simmediate = kSentinelS;
++        probe.immediate = kSentinelU;
++        std::string code = translate(probe, MemoryAccessHint{}, /*allowDynamic=*/false);
++        const std::string word = fmt::format("READ32(0x{:X}u)", inst.address);
++        const std::string liveS = fmt::format("((uint32_t)(int32_t)(int16_t)({} & 0xFFFFu))", word);
++        const std::string liveU = fmt::format("((uint32_t)({} & 0xFFFFu))", word);
++        const std::string sentS = std::to_string(kSentinelS);
++        const std::string sentU = std::to_string(kSentinelU);
++        bool replaced = false;
++        for (const auto &[from, to] : {std::pair{sentU, liveU}, std::pair{sentS, liveS}})
++        {
++            for (size_t pos = code.find(from); pos != std::string::npos; pos = code.find(from, pos + to.size()))
++            {
++                code.replace(pos, from.size(), to);
++                replaced = true;
++            }
++        }
++        if (!replaced)
++        {
++            return code + fmt::format(" /* WARNING: dynamic immediate at 0x{:X} not applied for this opcode */", inst.address);
++        }
++        return code + " /* dynamic immediate */";
++    }
++
+     InstructionTranslator::InstructionTranslator(CodeGenerator &codeGenerator)
+         : m_codeGenerator(codeGenerator)
+     {
+@@ -120,13 +151,18 @@ namespace ps2recomp
+         return fmt::format("WRITE{}({}, {})", width, addr, value);
+     }
+ 
+-    std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
++    std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint, bool allowDynamic)
+     {
+         if (inst.isMMI)
+         {
+             return m_codeGenerator.translateMMIInstruction(inst);
+         }
+ 
++        if (allowDynamic && m_codeGenerator.isDynamicImmediate(inst.address))
++        {
++            return translateDynamicImmediate(inst);
++        }
++
+         const MemoryAccessHint effectiveMemoryHint = effectiveMemoryHintFor(inst, memoryHint);
+ 
+         auto genRead = [&](int width, const std::string &addr)
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 8c1c7c5..5103fe9 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1022,6 +1022,7 @@ namespace ps2recomp
+             m_codeGenerator->setRelocationCallNames(relocationCallNames);
+             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
++            m_codeGenerator->setDynamicImmediates(m_config.dynamicImmediates);
+             m_codeGenerator->setEmitInstructionComments(true);
+ 
+             fs::create_directories(m_config.outputPath);
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..76a9559 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -783,7 +783,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vis = inst.rt; // VSQI/VSQD: it = bits 16-20 (rt), fs = bits 11-15 (rd)
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+                            "__m128i old_val = READ128(addr); "
+@@ -791,7 +791,7 @@ namespace ps2recomp
+                            "WRITE128(addr, _mm_castps_si128(res)); "
+                            "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+                            vis,
+-                           inst.rt,
++                           inst.rd,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+                            vis, vis);
+@@ -815,7 +815,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vis = inst.rt; // VSQI/VSQD: it = bits 16-20 (rt), fs = bits 11-15 (rd)
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+                            "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+@@ -824,7 +824,7 @@ namespace ps2recomp
+                            "WRITE128(addr, _mm_castps_si128(res)); }}",
+                            vis, vis,
+                            vis,
+-                           inst.rt,
++                           inst.rd,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
+     }
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..637593a 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -384,6 +384,7 @@ private:
+     void applyPendingPreemption();
+     void processPendingEvents();
+     void processDueDeadlines();
++    void pollGsInterrupt();
+     void processEvent(const EeEvent &event);
+     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
+     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
+@@ -419,6 +420,7 @@ private:
+     int m_dmacHeadOrder = 0;
+     int m_dmacTailOrder = 1000;
+     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
++    uint64_t m_gsIrqReported = 0u; // CSR SIGNAL/FINISH/VSINT bits already raised as INTC cause 0
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..ddd8a2c 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstdio>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -286,6 +288,16 @@ void EeScheduler::run()
+             continue;
+         }
+         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        if (context.in_delay_slot)
++        {
++            static int delayReports = 0;
++            if (delayReports < 50)
++            {
++                ++delayReports;
++                std::fprintf(stderr, "[EE sched] resuming thread %d inside a delay slot: pc=0x%08X branch_pc=0x%08X sp=0x%08X ra=0x%08X\n",
++                             running->id, context.pc, context.branch_pc, getRegU32(&context, 29), getRegU32(&context, 31));
++            }
++        }
+ 
+         if (checkpointDue(kGuestDispatchCycles))
+         {
+@@ -490,6 +502,10 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     }
+ 
+     target->context = R5900Context{};
++    // VF0 is hardwired to (0,0,0,1) on the VU; R5900Context's constructor zeroes it, so every thread
++    // other than the boot thread used to see vf0.w == 0 (breaks e.g. 1-x*x via vsub from vf0).
++    target->context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++    target->context.vu0_r = _mm_castsi128_ps(_mm_set1_epi32(0x3F800000));
+     target->context.pc = target->entry;
+     target->arg = arg;
+     target->suspendCount = 0;
+@@ -1342,6 +1358,13 @@ void EeScheduler::completeVSync(uint64_t tick)
+         }
+     }
+     std::sort(completed.begin(), completed.end());
++    if (std::getenv("SOTC_TRACE_VSYNC") && (tick % 300u) == 0u)
++    {
++        std::fprintf(stderr, "[vsync] tick=%llu completed=%zu threads:", (unsigned long long)tick, completed.size());
++        for (const auto &[id, candidate] : m_threads)
++            std::fprintf(stderr, " %d:st%d/r%d", id, (int)candidate.status, (int)candidate.wait.reason);
++        std::fprintf(stderr, "\n");
++    }
+     for (const int id : completed)
+     {
+         GuestThread *waiter = thread(id);
+@@ -1484,6 +1507,13 @@ EeKernelSnapshot EeScheduler::snapshot() const
+ 
+ void EeScheduler::publishSnapshot()
+ {
++    // The snapshot only feeds debug views and watchdogs, but it is rebuilt on every semaphore
++    // signal and guest branch dispatch (~8% of run time). Rebuild it at most every 1M EE cycles.
++    static thread_local uint64_t lastPublishedCycle = 0;
++    static const bool alwaysPublish = std::getenv("PS2X_EXACT_SNAPSHOT") != nullptr;
++    if (!alwaysPublish && m_eeCycle - lastPublishedCycle < 1000000u && m_eeCycle >= lastPublishedCycle)
++        return;
++    lastPublishedCycle = m_eeCycle;
+     EeKernelSnapshot next{};
+     next.sequence = ++m_snapshotSequence;
+     next.eeCycle = m_eeCycle;
+@@ -1740,10 +1770,31 @@ void EeScheduler::applyPendingPreemption()
+     m_timeSliceExpired = false;
+ }
+ 
++// GS interrupt (INTC cause 0): the GS raises it while CSR.SIGNAL/FINISH/HSINT/VSINT is set
++// and the matching IMR mask bit (SIGMSK=8, FINISHMSK=9, HSMSK=10, VSMSK=11) is clear. The game
++// acknowledges by writing 1 to the CSR bit (write-one-to-clear). Edge-triggered here: an event
++// is raised once per newly set, unmasked bit.
++void EeScheduler::pollGsInterrupt()
++{
++    assertExecutor();
++    auto &gs = m_runtime.memory().gs();
++    const uint64_t pending = gs.csr.load(std::memory_order_acquire) & 0xFull;
++    const uint64_t masked = (gs.imr >> 8) & 0xFull;
++    const uint64_t active = pending & ~masked;
++    // The GS interrupt line is the OR of the unmasked CSR bits. Raise INTC 0 whenever a bit becomes
++    // active, including when the game unmasks a bit that is still pending (it may have masked it in
++    // IMR instead of acknowledging it in CSR).
++    const uint64_t newlyActive = active & ~m_gsIrqReported;
++    m_gsIrqReported = active;
++    if (newlyActive != 0u)
++        dispatchIrq(false, 0u);
++}
++
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
+     processDueDeadlines();
++    pollGsInterrupt();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+     for (uint32_t timer = 0u; timer < 4u; ++timer)
+@@ -1798,6 +1849,10 @@ void EeScheduler::processDueDeadlines()
+                 return;
+             }
+ 
++            static const bool noPacing = std::getenv("PS2X_NO_PACING") != nullptr;
++            if (noPacing)
++                pacingDeadline = now;
++
+             if (now < pacingDeadline)
+             {
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+@@ -1814,7 +1869,7 @@ void EeScheduler::processDueDeadlines()
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+                                               [this, pacedNow](const ScheduledEvent &item)
+                                               { return item.deadlineCycle <= m_eeCycle &&
+-                                                       item.hostDeadline <= pacedNow; });
++                                                       (noPacing || item.hostDeadline <= pacedNow); });
+             due.insert(due.end(),
+                        std::make_move_iterator(m_deadlines.begin()),
+                        std::make_move_iterator(firstFuture));
+@@ -1859,6 +1914,8 @@ void EeScheduler::processDueDeadlines()
+     }
+ }
+ 
++void ps2xFlushLazyVif1Chain(PS2Memory &memory);
++
+ void EeScheduler::processEvent(const EeEvent &event)
+ {
+     switch (event.type)
+@@ -1867,6 +1924,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         requestStop();
+         break;
+     case EeEventType::VBlankStart:
++        ps2xFlushLazyVif1Chain(m_runtime.memory());
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+@@ -1877,6 +1935,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         {
+             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+         }
++        m_runtime.memory().gs().csr.fetch_or(0x8ull, std::memory_order_acq_rel); // CSR.VSINT
+         writeGuestU32(m_vsyncFlagAddress, 1u);
+         if (m_vsyncTickAddress != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..e786e9c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -434,6 +434,8 @@ namespace
+ 
+     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+     {
++        if (std::getenv("SOTC_TRACE_CDREAD"))
++            std::fprintf(stderr, "[cdread] lbn=%u sectors=%u dst=%p bytes=%zu\n", lbn, sectors, (void *)dst, byteCount);
+         for (const auto &[key, entry] : g_cdFilesByKey)
+         {
+             const uint32_t endLbn = entry.baseLbn + entry.sectors;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..df5607b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,9 @@
++#include <mutex>
++#include <string>
++#include <map>
++#include <vector>
++#include <cstdlib>
++#include <cstdio>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -296,7 +302,12 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // Inline round-half-away-from-zero (same result as std::lround for this range, no libm call).
++        const float value = top + (bottom - top) * fy;
++        const float mag = value < 0.0f ? -value : value;
++        const int whole = static_cast<int>(mag);
++        const int rounded = whole + ((mag - static_cast<float>(whole)) >= 0.5f ? 1 : 0);
++        return clampU8(value < 0.0f ? -rounded : rounded);
+     }
+ }
+ 
+@@ -543,8 +554,118 @@ void GSCpuBackend::ResetUnlocked()
+     m_localToHostReadPos = 0u;
+ }
+ 
++// Test fast-forward: when set, primitives are dropped (transfers still happen).
++std::atomic<bool> g_ps2xSkipDraws{false};
++// Per-primitive-type submit counters (diagnostics; read and reset by the game override).
++std::atomic<uint64_t> g_ps2xPrimCount[8];
++std::atomic<uint64_t> g_ps2xPrimTex{0}, g_ps2xPrimClipped{0};
++// One-frame draw-state histogram (set by the game override for a chosen vsync tick).
++std::atomic<bool> g_ps2xStateHist{false};
++std::mutex g_ps2xStateHistMutex;
++std::map<std::string, uint64_t> g_ps2xStateHistMap;
++std::vector<std::string> g_ps2xStateHistOrder;
++std::atomic<uint64_t> g_ps2xFogHist[256];
++std::atomic<uint32_t> g_ps2xFogColor{0};
++std::atomic<uint64_t> g_ps2xZMin{~0ull}, g_ps2xZMax{0};
++std::mutex g_ps2xVtxSampleMutex;
++std::vector<std::string> g_ps2xVtxSamples;
++
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    g_ps2xPrimCount[batch.state.prim.type & 7u].fetch_add(1u, std::memory_order_relaxed);
++    if (batch.state.prim.tme)
++        g_ps2xPrimTex.fetch_add(1u, std::memory_order_relaxed);
++    if (g_ps2xStateHist.load(std::memory_order_relaxed))
++    {
++        const auto &st = batch.state;
++        const auto &cx = st.context;
++        char key[384];
++        std::snprintf(key, sizeof(key),
++                      "type=%u tme=%u abe=%u fge=%u fst=%u ctxt=%u | fbp=%u fbw=%u fpsm=%u fbmsk=%08X | zbp=%u zpsm=%u zmsk=%u | test=%05llX alpha=%llX fba=%llu | tbp=%u tbw=%u tpsm=%u tw=%u th=%u tfx=%u tcc=%u cbp=%u | sc=%u,%u-%u,%u ofs=%u,%u",
++                      (unsigned)st.prim.type, st.prim.tme, st.prim.abe, st.prim.fge, st.prim.fst, st.prim.ctxt,
++                      cx.frame.fbp, cx.frame.fbw, cx.frame.psm, cx.frame.fbmsk, cx.zbuf.zbp, cx.zbuf.psm, (unsigned)cx.zbuf.zmask,
++                      (unsigned long long)(cx.test & 0x7FFFFull), (unsigned long long)cx.alpha, (unsigned long long)cx.fba,
++                      cx.tex0.tbp0, cx.tex0.tbw, cx.tex0.psm, cx.tex0.tw, cx.tex0.th, cx.tex0.tfx, cx.tex0.tcc, cx.tex0.cbp,
++                      cx.scissor.x0, cx.scissor.y0, cx.scissor.x1, cx.scissor.y1, cx.xyoffset.ofx >> 4, cx.xyoffset.ofy >> 4);
++        if (st.prim.type >= 3u && st.prim.type <= 5u && batch.vertexCount >= 3u)
++        {
++            const auto &va = batch.vertices[0], &vb = batch.vertices[1], &vc = batch.vertices[2];
++            const bool degenerate = (va.x == vb.x && va.y == vb.y) || (va.x == vc.x && va.y == vc.y) || (vb.x == vc.x && vb.y == vc.y);
++            const bool offscreen = va.x < 1024.0f || va.x > 3072.0f || va.y < 1024.0f || va.y > 3072.0f;
++            const size_t used = std::strlen(key);
++            const bool collapsed = va.x == vb.x && va.y == vb.y && va.x == vc.x && va.y == vc.y;
++            std::snprintf(key + used, sizeof(key) - used, "%s%s%s", collapsed ? " COLLAPSED" : (degenerate ? " DEGEN" : ""), offscreen ? " FAR" : "",
++                          collapsed ? (va.x == 0.0f && va.y == 0.0f ? "@0" : "@pt") : "");
++        }
++        if (st.prim.fge && st.prim.type >= 3u && st.prim.type <= 5u)
++        {
++            for (uint32_t vi = 0; vi < batch.vertexCount && vi < 3u; ++vi)
++            {
++                g_ps2xFogHist[batch.vertices[vi].fog].fetch_add(1u, std::memory_order_relaxed);
++                const uint64_t z = static_cast<uint64_t>(batch.vertices[vi].z);
++                uint64_t cur = g_ps2xZMin.load();
++                while (z < cur && !g_ps2xZMin.compare_exchange_weak(cur, z)) {}
++                cur = g_ps2xZMax.load();
++                while (z > cur && !g_ps2xZMax.compare_exchange_weak(cur, z)) {}
++            }
++            {
++                std::lock_guard<std::mutex> sl(g_ps2xVtxSampleMutex);
++                if (g_ps2xVtxSamples.size() < 24u)
++                {
++                    char line[256];
++                    const auto &a = batch.vertices[0], &b = batch.vertices[1], &c = batch.vertices[2];
++                    std::snprintf(line, sizeof(line), "(%.1f,%.1f z=%.0f q=%g s=%g t=%g rgba=%u,%u,%u,%u) (%.1f,%.1f) (%.1f,%.1f)",
++                                  a.x, a.y, a.z, a.q, a.s, a.t, a.r, a.g, a.b, a.a, b.x, b.y, c.x, c.y);
++                    g_ps2xVtxSamples.emplace_back(line);
++                }
++            }
++            g_ps2xFogColor.store(static_cast<uint32_t>(st.fogR) | (static_cast<uint32_t>(st.fogG) << 8) | (static_cast<uint32_t>(st.fogB) << 16));
++        }
++        // SOTC_FB_STEPS: dump the display buffer (fbp 232, 512x416) whenever the draw state changes in the hist frame
++        static const bool fbSteps = std::getenv("SOTC_FB_STEPS") != nullptr;
++        static std::string lastKey;
++        static int stepNo = 0;
++        static const int fbFrom = std::getenv("SOTC_FB_STEPS_FROM") ? std::atoi(std::getenv("SOTC_FB_STEPS_FROM")) : 0;
++        if (fbSteps && lastKey != key && stepNo < fbFrom)
++            ++stepNo;
++        else if (fbSteps && lastKey != key && stepNo < fbFrom + 700)
++        {
++            char path[96];
++            std::snprintf(path, sizeof(path), "/tmp/fbstep_%03d.ppm", stepNo);
++            if (FILE *f = std::fopen(path, "wb"))
++            {
++                std::fprintf(f, "P6\n512 416\n255\n");
++                std::vector<uint8_t> row(512 * 3);
++                const uint32_t base = GSInternal::framePageBaseToBlock(232);
++                for (int y = 0; y < 416; ++y)
++                {
++                    for (int x = 0; x < 512; ++x)
++                    {
++                        const uint32_t c = ReadVram(GS_PSM_CT32, base, 8, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
++                        row[x * 3 + 0] = static_cast<uint8_t>(c & 0xFF);
++                        row[x * 3 + 1] = static_cast<uint8_t>((c >> 8) & 0xFF);
++                        row[x * 3 + 2] = static_cast<uint8_t>((c >> 16) & 0xFF);
++                    }
++                    std::fwrite(row.data(), 1, row.size(), f);
++                }
++                std::fclose(f);
++            }
++            if (FILE *f = std::fopen("/tmp/fbstep_keys.txt", "a")) { std::fprintf(f, "%03d %s\n", stepNo, key); std::fclose(f); }
++            ++stepNo;
++        }
++        lastKey = key;
++        std::lock_guard<std::mutex> hl(g_ps2xStateHistMutex);
++        auto it = g_ps2xStateHistMap.find(key);
++        if (it == g_ps2xStateHistMap.end())
++        {
++            g_ps2xStateHistMap.emplace(key, 1u);
++            g_ps2xStateHistOrder.emplace_back(key);
++        }
++        else
++            ++it->second;
++    }
++    if (g_ps2xSkipDraws.load(std::memory_order_relaxed))
++        return;
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+@@ -586,6 +707,18 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+     }
+ 
+     LoadClutUnlocked(tex0, texclut);
++    {
++        static const bool trace = std::getenv("SOTC_TRACE_CLUT") != nullptr;
++        static int n = 0;
++        if (trace && n < 80)
++        {
++            ++n;
++            std::fprintf(stderr, "[CLUT] psm=%u cbp=%u cpsm=%u csm=%u csa=%u cld=%u ->", tex0.psm, tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld);
++            for (int i = 0; i < 6; ++i)
++                std::fprintf(stderr, " %04x%04x", m_clut[i + 256], m_clut[i]);
++            std::fprintf(stderr, "\n");
++        }
++    }
+ }
+ 
+ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -846,9 +979,30 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
++extern std::atomic<bool> g_ps2xStateHist;
++namespace
++{
++    // SOTC_PIXEL_PROBE=x,y : log every write/reject at this framebuffer pixel (fbp 232) during the hist frame
++    bool pixelProbeHit(const GSContext &ctx, int x, int y)
++    {
++        static const int px = std::getenv("SOTC_PIXEL_PROBE") ? std::atoi(std::getenv("SOTC_PIXEL_PROBE")) : -1;
++        static const int py = [] { const char *e = std::getenv("SOTC_PIXEL_PROBE"); const char *c = e ? std::strchr(e, ',') : nullptr; return c ? std::atoi(c + 1) : -1; }();
++        (void)ctx; return px >= 0 && x == px && y == py && g_ps2xStateHist.load(std::memory_order_relaxed);
++    }
++}
++
+ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+ {
+     const auto &ctx = state.context;
++    const bool probe = pixelProbeHit(ctx, x, y);
++    auto probeLog = [&](const char *what, uint32_t storedZv, uint32_t outPixel) {
++        static int n = 0;
++        if (n++ < 400)
++            std::fprintf(stderr, "[PROBE] %s fbp=%u prim=%u tme=%u abe=%u tbp=%u tpsm=%u test=%05llX alpha=%llX zmsk=%u fbmsk=%08X z=%d stored=%u src=%u,%u,%u,%u out=%08X\n",
++                         what, ctx.frame.fbp, (unsigned)state.prim.type, state.prim.tme, state.prim.abe, ctx.tex0.tbp0, ctx.tex0.psm,
++                         (unsigned long long)(ctx.test & 0x7FFFFull), (unsigned long long)ctx.alpha, (unsigned)ctx.zbuf.zmask, ctx.frame.fbmsk,
++                         z, storedZv, r, g, b, a, outPixel);
++    };
+     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
+         return;
+ 
+@@ -871,16 +1025,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+     const u32 zpsm = ctx.zbuf.psm;
+ 
+-    const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
++    // Debug switches (render experiments): PS2X_GS_NO_ATEST / PS2X_GS_NO_ZTEST / PS2X_GS_NO_DATE
++    static const bool dbgNoAtest = std::getenv("PS2X_GS_NO_ATEST") != nullptr;
++    static const bool dbgNoZtest = std::getenv("PS2X_GS_NO_ZTEST") != nullptr;
++    static const bool dbgNoDate = std::getenv("PS2X_GS_NO_DATE") != nullptr;
++    uint64_t testReg = ctx.test;
++    if (dbgNoAtest) testReg &= ~0x1ull;
++    if (dbgNoDate) testReg &= ~(1ull << 14);
++    if (dbgNoZtest && ((testReg >> 16) & 1u)) testReg = (testReg & ~(3ull << 17)) | (1ull << 17);
++    const PixelWriteMask writeMask = classifyAlphaTest(testReg, a, static_cast<uint8_t>(fpsm));
+     if (!writeMask.writesAnything())
+     {
++        if (probe) probeLog("ATESTFAIL", 0u, 0u);
+         return;
+     }
+ 
+-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    const uint32_t ztestMethod = static_cast<uint32_t>((testReg >> 17) & 3u);
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+-    const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
++    const bool destinationAlphaTestNeedsRead = ((testReg >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
+ 
+     // small optimization, avoid reading the framebuffer for simple draws
+     // TODO: only one address lookup for rmw
+@@ -904,8 +1067,9 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         }
+     }
+ 
+-    if (!passesDestinationAlphaTest(ctx.test, static_cast<uint8_t>(fpsm), rawFramebufferPixel))
++    if (!passesDestinationAlphaTest(testReg, static_cast<uint8_t>(fpsm), rawFramebufferPixel))
+     {
++        if (probe) probeLog("DATEFAIL", 0u, rawFramebufferPixel);
+         return;
+     }
+ 
+@@ -931,6 +1095,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+ 
+     if (!zpass)
+     {
++        if (probe) probeLog("ZFAIL", storedZ, 0u);
+         return;
+     }
+ 
+@@ -1003,8 +1168,22 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+             pixel = Rgba8888ToRgba5551(pixel);
+         }
+ 
++        {
++            static const bool trace = std::getenv("SOTC_TRACE_GREEN") != nullptr;
++            static int hits = 0;
++            if (trace && hits < 6 && (pixel & 0xFFFFFFu) == 0x096C12u)
++            {
++                ++hits;
++                std::fprintf(stderr, "[GREEN] z=%u stored=%u zbp=%u zpsm=%u fbp=%u xy=%d,%d src=%u,%u,%u,%u dst=%08x prim=%d tme=%d abe=%d alpha=%llx test=%llx tex psm=%u tbp=%u cbp=%u cpsm=%u tfx=%u tcc=%u\n",
++                             (unsigned)z, storedZ, ctx.zbuf.zbp, zpsm, ctx.frame.fbp, x, y, srcR, srcG, srcB, a, fbrgba, (int)state.prim.type, state.prim.tme, state.prim.abe,
++                             (unsigned long long)ctx.alpha, (unsigned long long)ctx.test, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.tfx, ctx.tex0.tcc);
++            }
++        }
+         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
++        if (probe) probeLog(writeMask.writeDepth && !ctx.zbuf.zmask ? "WRITE+Z" : "WRITE", storedZ, pixel);
+     }
++    else if (probe)
++        probeLog(writeMask.writeDepth && !ctx.zbuf.zmask ? "ZONLY" : "NOWRITE", storedZ, 0u);
+ 
+     if (writeMask.writeDepth && !ctx.zbuf.zmask)
+     {
+@@ -1127,6 +1306,10 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+     const float fx = sampleU - static_cast<float>(u0);
+     const float fy = sampleV - static_cast<float>(v0);
+ 
++    // Exact texel centres (1:1 copies): bilinear weights are zero, result is exactly c00.
++    if (fx == 0.0f && fy == 0.0f)
++        return samplePoint(u0, v0);
++
+     const uint32_t c00 = samplePoint(u0, v0);
+     const uint32_t c10 = samplePoint(u1, v0);
+     const uint32_t c01 = samplePoint(u0, v1);
+@@ -1234,6 +1417,44 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
++        // Fast path for FST sprites (full-screen copies, UI): the texel coordinate of a column/row
++        // does not depend on the other axis, so compute each once with exactly the same float math.
++        if (state.prim.fst && drawX1 >= drawX0 && drawY1 >= drawY0)
++        {
++            thread_local std::vector<uint16_t> colU, rowV;
++            colU.resize(static_cast<size_t>(drawX1 - drawX0 + 1));
++            rowV.resize(static_cast<size_t>(drawY1 - drawY0 + 1));
++            for (int x = drawX0; x <= drawX1; ++x)
++            {
++                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
++                float texUf = u0f + (u1f - u0f) * tx;
++                const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
++                colU[static_cast<size_t>(x - drawX0)] = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
++            }
++            for (int y = drawY0; y <= drawY1; ++y)
++            {
++                float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
++                float texVf = v0f + (v1f - v0f) * ty;
++                const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
++                rowV[static_cast<size_t>(y - drawY0)] = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
++            }
++            for (int y = drawY0; y <= drawY1; ++y)
++            {
++                const uint16_t sampleV = rowV[static_cast<size_t>(y - drawY0)];
++                for (int x = drawX0; x <= drawX1; ++x)
++                {
++                    const uint32_t texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, colU[static_cast<size_t>(x - drawX0)], sampleV);
++                    const TextureCombineResult color = combineTexture(tex, r, g, b, a,
++                                                                      static_cast<uint8_t>(texel & 0xFF),
++                                                                      static_cast<uint8_t>((texel >> 8) & 0xFF),
++                                                                      static_cast<uint8_t>((texel >> 16) & 0xFF),
++                                                                      static_cast<uint8_t>((texel >> 24) & 0xFF));
++                    WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
++                }
++            }
++            return;
++        }
++
+         for (int y = drawY0; y <= drawY1; ++y)
+         {
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..4fcc6a1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -6,6 +6,8 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
+@@ -410,6 +412,56 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+ 
+ void GS::recordDrawDebugEventUnlocked(int vertexCount)
+ {
++    {
++        static const bool traceEnv = std::getenv("SOTC_TRACE_GS") != nullptr;
++        static const double traceDelay = std::getenv("SOTC_TRACE_GS_DELAY") ? std::atof(std::getenv("SOTC_TRACE_GS_DELAY")) : 0.0;
++        static const auto traceStart = std::chrono::steady_clock::now();
++        const bool trace = traceEnv && std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count() >= traceDelay;
++        static std::atomic<int> printed{0};
++        static uint64_t seen[512];
++        static int seenN = 0;
++        if (trace && vertexCount > 0)
++        {
++            const uint32_t ci = m_prim.ctxt ? 1u : 0u;
++            const auto &c = m_ctx[ci];
++            const GSVertex &v0 = m_vtxQueue[0];
++            const GSVertex &v1 = m_vtxQueue[std::min(vertexCount, kMaxVerts) - 1];
++            uint64_t sig = (uint64_t)m_prim.type | ((uint64_t)m_prim.tme << 3) | ((uint64_t)m_prim.abe << 4) |
++                           ((uint64_t)c.tex0.psm << 5) | ((uint64_t)c.tex0.tbp0 << 11) | ((uint64_t)c.frame.fbp << 25) |
++                           ((uint64_t)c.tex0.cpsm << 34) | ((uint64_t)c.tex0.cbp << 40) | ((uint64_t)v0.r << 54) ^ ((uint64_t)(int)v0.x << 20) ^ ((uint64_t)v0.a << 46);
++            {
++                static int triN = 0;
++                if (vertexCount >= 3 && c.tex0.psm == 20 && m_prim.tme && (v0.x < 1780.0f || v1.x < 1780.0f) && triN < 60)
++                {
++                    ++triN;
++                    std::fprintf(stderr, "    tri rgba: %u,%u,%u,%u / %u,%u,%u,%u / %u,%u,%u,%u iip=%d xy2=%.1f,%.1f uv2=%u,%u\n",
++                                 m_vtxQueue[0].r, m_vtxQueue[0].g, m_vtxQueue[0].b, m_vtxQueue[0].a,
++                                 m_vtxQueue[1].r, m_vtxQueue[1].g, m_vtxQueue[1].b, m_vtxQueue[1].a,
++                                 m_vtxQueue[2].r, m_vtxQueue[2].g, m_vtxQueue[2].b, m_vtxQueue[2].a, (int)m_prim.iip,
++                                 m_vtxQueue[2].x, m_vtxQueue[2].y, m_vtxQueue[2].u, m_vtxQueue[2].v);
++                }
++            }
++            bool dup = false;
++            for (int i = 0; i < seenN; ++i)
++                if (seen[i] == sig) { dup = true; break; }
++            if (!dup && seenN < 512 && printed.load() < 400)
++            {
++                seen[seenN++] = sig;
++                printed.fetch_add(1);
++                std::fprintf(stderr, "[GS draw] prim=%d tme=%d abe=%d fst=%d ctx=%u n=%d frame fbp=%u fbw=%u psm=%u msk=%08x | tex tbp=%u tbw=%u psm=%u tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=%u csm=%u csa=%u | v0 xy=%.1f,%.1f rgba=%u,%u,%u,%u uv=%u,%u st=%.3f,%.3f | v1 xy=%.1f,%.1f | z=%.0f,%.0f fge=%d\n",
++                             (int)m_prim.type, m_prim.tme, m_prim.abe, m_prim.fst, ci, vertexCount,
++                             c.frame.fbp, c.frame.fbw, c.frame.psm, c.frame.fbmsk,
++                             c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th, c.tex0.tcc, c.tex0.tfx,
++                             c.tex0.cbp, c.tex0.cpsm, c.tex0.csm, c.tex0.csa,
++                             v0.x, v0.y, v0.r, v0.g, v0.b, v0.a, v0.u, v0.v, v0.s, v0.t, v1.x, v1.y, v0.z, v1.z, (int)m_prim.fge);
++                if (m_prim.type == GS_PRIM_SPRITE)
++                    std::fprintf(stderr, "    ctx: test=%llx alpha=%llx fba=%llx scissor=%u-%u,%u-%u ofs=%u,%u zbuf zbp=%u psm=%u msk=%d\n",
++                                 (unsigned long long)c.test, (unsigned long long)c.alpha, (unsigned long long)c.fba,
++                                 c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1, c.xyoffset.ofx >> 4, c.xyoffset.ofy >> 4,
++                                 c.zbuf.zbp, c.zbuf.psm, (int)c.zbuf.zmask);
++            }
++        }
++    }
+     if (m_debugHistoryPaused)
+     {
+         return;
+@@ -447,6 +499,17 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
+ 
+ void GS::recordTransferDebugEventUnlocked()
+ {
++    {
++        static const bool trace = std::getenv("SOTC_TRACE_GS") != nullptr;
++        static int printed = 0;
++        if ((trace || std::getenv("SOTC_TRACE_CLUT")) && printed < 300)
++        {
++            ++printed;
++            std::fprintf(stderr, "[GS xfer] sbp=%u sbw=%u spsm=%u dbp=%u dbw=%u dpsm=%u spos=%u,%u dpos=%u,%u dir=%u size=%ux%u\n",
++                         m_bitbltbuf.sbp, m_bitbltbuf.sbw, m_bitbltbuf.spsm, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
++                         m_trxpos.ssax, m_trxpos.ssay, m_trxpos.dsax, m_trxpos.dsay, m_trxpos.dir, m_trxreg.rrw, m_trxreg.rrh);
++        }
++    }
+     if (m_debugHistoryPaused)
+     {
+         return;
+@@ -551,6 +614,21 @@ void GS::latchHostPresentationFrame()
+         }
+     }
+ 
++    {
++        static const bool trace = std::getenv("SOTC_TRACE_PRESENT") != nullptr;
++        static uint32_t n = 0;
++        if (trace && (n++ % 60u) == 0u)
++        {
++            uint32_t nonBlack = 0u;
++            for (size_t i = 0; i + 3 < frame.pixels.size(); i += 4)
++                if (frame.pixels[i] | frame.pixels[i + 1] | frame.pixels[i + 2])
++                    ++nonBlack;
++            std::fprintf(stderr, "[present] pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx -> ok=%d %ux%u disp=%u src=%u pref=%d nonblack=%u\n",
++                         (unsigned long long)request.pmode, (unsigned long long)request.smode2, (unsigned long long)request.dispfb1,
++                         (unsigned long long)request.display1, (unsigned long long)request.dispfb2, (unsigned long long)request.display2,
++                         (int)static_cast<bool>(frame), frame.width, frame.height, frame.displayFbp, frame.sourceFbp, (int)frame.usedPreferred, nonBlack);
++        }
++    }
+     const bool hasFrame = static_cast<bool>(frame);
+     const uint32_t displayFbp = frame.displayFbp;
+     const uint32_t sourceFbp = frame.sourceFbp;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..ecd7f1e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1122,8 +1122,43 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     }
+ }
+ 
++namespace
++{
++    // Lazy VIF1 chain DMA: the PS2 DMAC walks a chain while the EE keeps appending to it
++    // (SotC kicks VIF1 and only then writes the rest of the packet). Walking the whole chain at
++    // the moment of the CHCR write sees half-built tags, so the walk is deferred until the game
++    // looks at the channel again, kicks another DMA, or the frame ends.
++    bool g_lazyVif1Enabled = std::getenv("PS2X_LAZY_VIF1_CHAIN") != nullptr;
++    bool g_lazyVif1Pending = false;
++    bool g_lazyVif1Replay = false;
++    uint32_t g_lazyVif1Chcr = 0u;
++}
++
++void ps2xFlushLazyVif1Chain(PS2Memory &memory)
++{
++    if (!g_lazyVif1Pending || g_lazyVif1Replay)
++        return;
++    g_lazyVif1Pending = false;
++    g_lazyVif1Replay = true;
++    memory.writeIORegister(0x10009000u, g_lazyVif1Chcr);
++    g_lazyVif1Replay = false;
++}
++
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (g_lazyVif1Enabled && !g_lazyVif1Replay && address >= 0x10009000u && address < 0x10009100u)
++    {
++        const bool vif1ChainKick = address == 0x10009000u && (value & 0x100u) != 0u && ((value >> 2) & 3u) == 1u;
++        if (g_lazyVif1Pending)
++            ps2xFlushLazyVif1Chain(*this);
++        if (vif1ChainKick)
++        {
++            g_lazyVif1Pending = true;
++            g_lazyVif1Chcr = value;
++            m_ioRegisters[0x10009000u] = value; // STR stays set until the deferred walk
++            return true;
++        }
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1344,7 +1379,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Real DMAC has no tag limit; SotC frames use ~11.5k tags (4096 dropped every late draw incl. the player).
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1404,6 +1440,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                     int tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
++                    struct SotcTagLog { uint32_t tadr; uint64_t tag; uint32_t v0, v1; };
++                    std::vector<SotcTagLog> sotcTags;
++                    const bool sotcTagTrace = channelBase == 0x10009000u && std::getenv("SOTC_TRACE_VIFCHAIN");
++                    bool sotcSuspicious = false;
+ 
+                     while (tagsProcessed < kMaxChainTags)
+                     {
+@@ -1512,6 +1552,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                         if (transferTagData)
+                             appendVifTagData(currentTagAddr);
++                        if (sotcTagTrace)
++                        {
++                            uint32_t v0 = 0, v1 = 0;
++                            std::memcpy(&v0, tp + 8, 4);
++                            std::memcpy(&v1, tp + 12, 4);
++                            sotcTags.push_back({currentTagAddr, tag, v0, v1});
++                            if ((id == 0u || id == 3u || id == 4u) && tagQwc != 0u && (addr < 0x1000u || addr >= 0x02000000u) && (addr & 0x80000000u) == 0u)
++                                sotcSuspicious = true;
++                        }
++                        if (channelBase == 0x10009000u && std::getenv("SOTC_TRACE_VIFTAG"))
++                        {
++                            static std::atomic<int> logged{0};
++                            uint32_t up0 = 0, up1 = 0;
++                            std::memcpy(&up0, tp + 8, 4);
++                            std::memcpy(&up1, tp + 12, 4);
++                            if (((up0 >> 24) & 0x7Fu) == 0u && (up0 & 0xFFFFu) != 0u && logged.fetch_add(1) < 12)
++                                std::fprintf(stderr, "[VIF1 tag] tadr=0x%X id=%u qwc=%u addr=0x%X tte=%d chcr=0x%X vif=%08X %08X tag=%016llX\n",
++                                             currentTagAddr, id, tagQwc, addr, (int)transferTagData, chcr, up0, up1, (unsigned long long)tag);
++                        }
+ 
+                         if (hasPayload)
+                             appendData(dataAddr, tagQwc);
+@@ -1521,6 +1580,31 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (sotcSuspicious)
++                    {
++                        static std::atomic<int> chains{0};
++                        if (chains.fetch_add(1) < 3)
++                        {
++                            std::fprintf(stderr, "[VIF1 chain] start tadr=0x%X madr=0x%X qwc=%u chcr=0x%X tags=%zu\n",
++                                         m_ioRegisters[channelBase + 0x30], madr, qwc, value, sotcTags.size());
++                            {
++                                const uint32_t badTadr = sotcTags.back().tadr;
++                                std::fprintf(stderr, "   memory around 0x%X:\n", badTadr);
++                                for (uint32_t q = 0; q < 12; ++q)
++                                {
++                                    const uint32_t a = (badTadr - 0x40u + q * 16u) & (PS2_RAM_SIZE - 1u);
++                                    uint32_t w[4];
++                                    std::memcpy(w, m_rdram + a, 16);
++                                    std::fprintf(stderr, "     %08X: %08X %08X %08X %08X\n", a, w[0], w[1], w[2], w[3]);
++                                }
++                            }
++                            for (size_t k = 0; k < sotcTags.size(); ++k)
++                                if (k < 24 || k + 8 >= sotcTags.size())
++                                    std::fprintf(stderr, "   #%zu tadr=0x%X id=%u qwc=%u addr=0x%X vif=%08X %08X\n", k, sotcTags[k].tadr,
++                                                 (unsigned)((sotcTags[k].tag >> 28) & 7), (unsigned)(sotcTags[k].tag & 0xFFFF),
++                                                 (unsigned)((sotcTags[k].tag >> 32) & 0xFFFFFFFFu), sotcTags[k].v0, sotcTags[k].v1);
++                        }
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1592,6 +1676,16 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         return false;
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
++    if (std::getenv("SOTC_TRACE_SPR"))
++    {
++        static std::atomic<int> n{0};
++        static std::atomic<uint32_t> modeSeen[2][4];
++        const int dir = channelBase == kSprFromChannel ? 0 : 1;
++        if (modeSeen[dir][mode].fetch_add(1) < 3 || n.fetch_add(1) < 10)
++            std::fprintf(stderr, "[SPR %s] mode=%u chcr=0x%X madr=0x%X sadr=0x%X qwc=%u tadr=0x%X sqwc=0x%X\n",
++                         dir == 0 ? "from" : "to", mode, chcr, m_ioRegisters[channelBase + 0x10u], m_ioRegisters[channelBase + 0x80u],
++                         m_ioRegisters[channelBase + 0x20u], m_ioRegisters[channelBase + 0x30u], m_ioRegisters[0x1000E030u]);
++    }
+     if (mode != 0u)
+         return false;
+ 
+@@ -2280,6 +2374,8 @@ int PS2Memory::pollDmaRegisters()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (g_lazyVif1Pending && address >= 0x10009000u && address < 0x10009100u)
++        ps2xFlushLazyVif1Chain(*this);
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..3ea8440 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include <mutex>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -1342,6 +1343,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++namespace { thread_local uint64_t g_dispatchUnwindCount = 0; }
++extern std::atomic<bool> g_ps2xStateHist;
++std::mutex g_ps2xCallHistMutex;
++std::unordered_map<uint32_t, uint64_t> g_ps2xCallHist;
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1352,17 +1358,68 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ {
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
++    if (isCall && g_ps2xStateHist.load(std::memory_order_relaxed))
++    {
++        std::lock_guard<std::mutex> lock(g_ps2xCallHistMutex);
++        ++g_ps2xCallHist[targetPc];
++    }
++    {
++        // SotC diagnostics: stack consistency for calls made from inside a watched function range.
++        static const uint32_t rangeLo = [] { const char *e = std::getenv("PS2X_SPCHECK_LO"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
++        static const uint32_t rangeHi = [] { const char *e = std::getenv("PS2X_SPCHECK_HI"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
++        static const uint32_t frameSize = [] { const char *e = std::getenv("PS2X_SPCHECK_FRAME"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
++        if (rangeLo != 0u)
++        {
++            const uint32_t sp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
++            static uint32_t expected = 0u;
++            static uint32_t lastTarget = 0u, lastSource = 0u, lastSp = 0u;
++            static int reports = 0;
++            if (targetPc == rangeLo)
++                expected = sp - frameSize; // frame after the prologue
++            else if (sourcePc >= rangeLo && sourcePc < rangeHi && expected != 0u)
++            {
++                if (sp != expected && reports < 30)
++                {
++                    ++reports;
++                    std::fprintf(stderr, "[spcheck] call from 0x%08X -> 0x%08X with sp=0x%08X, expected 0x%08X (diff %d). previous call from 0x%08X -> 0x%08X had sp=0x%08X\n",
++                                 sourcePc, targetPc, sp, expected, static_cast<int>(sp - expected), lastSource, lastTarget, lastSp);
++                }
++                lastTarget = targetPc; lastSource = sourcePc; lastSp = sp;
++            }
++        }
++    }
++    {
++        // SotC diagnostics: who enters ClipCollisionDirectCallBackObjAry, and with which callback (t2)?
++        static const uint32_t watchTarget = [] { const char *e = std::getenv("PS2X_TRACE_BRANCH_TARGET"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
++        if (watchTarget != 0u && targetPc == watchTarget)
++        {
++            static int reports = 0;
++            const uint32_t t2 = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[10]));
++            const uint32_t sp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
++            const bool bad = t2 != 0u && (t2 < 0x00100000u || t2 >= 0x01600000u);
++            static uint32_t firstSp = sp;
++            if ((reports < 10 || bad || sp != firstSp) && reports < 300)
++            {
++                ++reports;
++                std::fprintf(stderr, "[branch-target] 0x%08X from 0x%08X kind=%d sp=0x%08X t2=0x%08X ra=0x%08X%s\n",
++                             targetPc, sourcePc, static_cast<int>(kind), sp, t2,
++                             static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])), bad ? " BAD" : "");
++            }
++        }
++    }
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        ++g_dispatchUnwindCount; // ctx->pc now names a not-yet-executed target; callers must unwind
+         return false;
+     }
+ 
+     if (!isCall)
+     {
++        ++g_dispatchUnwindCount;
+         if (!hasFunction(targetPc))
+         {
+             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+@@ -1396,14 +1453,34 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    static const bool spReturnCheck = std::getenv("PS2X_SP_RETURN_CHECK") != nullptr;
++    const uint32_t spBeforeCall = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
++    const uint64_t unwindsBefore = g_dispatchUnwindCount;
+     targetFn(rdram, ctx, this);
++    const bool unwound = g_dispatchUnwindCount != unwindsBefore;
++    if (spReturnCheck && ctx->pc == fallthroughPc)
++    {
++        const uint32_t spAfter = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
++        static int reports = 0;
++        static const uint32_t skipSource = [] { const char *e = std::getenv("PS2X_SP_RETURN_SKIP"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u; }();
++        if (spAfter != spBeforeCall && sourcePc != skipSource && reports < 40)
++        {
++            ++reports;
++            std::fprintf(stderr, "[sp-return] call 0x%08X -> 0x%08X returned with sp 0x%08X, was 0x%08X (diff %d)\n",
++                         sourcePc, targetPc, spAfter, spBeforeCall, static_cast<int>(spAfter - spBeforeCall));
++        }
++    }
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+     {
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc)
++    // A callee that never touched ctx->pc (HLE stub) counts as returned. But if a nested dispatch
++    // unwound with ctx->pc == targetPc (recursive call interrupted by a checkpoint), the call has NOT
++    // completed: treating it as returned skipped the nested frames' epilogues and leaked stack (SotC
++    // collision recursion 0x1129AF0 <-> 0x112F2D8 lost 0x70 bytes per level, then jumped to garbage).
++    if (ctx->pc == entryPc && !unwound)
+     {
+         ctx->pc = fallthroughPc;
+     }
+@@ -2211,7 +2288,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++    if (due)
++        ++g_dispatchUnwindCount; // generated code returns with ctx->pc at a loop head: an unwind, not a return
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..de2355b 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,29 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <vector>
++#include <cstdlib>
++#include <cstdio>
++#include <atomic>
++
++namespace sotc_vif_trace
++{
++    std::atomic<uint64_t> g_op[128];
++    std::atomic<uint64_t> g_calls{0}, g_bytes{0};
++    bool enabled()
++    {
++        static const bool on = std::getenv("SOTC_TRACE_VIF") != nullptr;
++        return on;
++    }
++    void dump()
++    {
++        std::fprintf(stderr, "[VIF1] calls=%llu bytes=%llu ops:", (unsigned long long)g_calls.load(), (unsigned long long)g_bytes.load());
++        for (int i = 0; i < 128; ++i)
++            if (g_op[i].load())
++                std::fprintf(stderr, " %02x:%llu", i, (unsigned long long)g_op[i].load());
++        std::fprintf(stderr, "\n");
++    }
++}
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -295,47 +318,69 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+ }
+ 
++namespace { std::vector<uint8_t> g_vif1Carry; }
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    std::vector<uint8_t> merged;
++    if (!g_vif1Carry.empty())
++    {
++        merged.swap(g_vif1Carry);
++        if (data && sizeBytes)
++            merged.insert(merged.end(), data, data + sizeBytes);
++        data = merged.data();
++        sizeBytes = static_cast<uint32_t>(merged.size());
++    }
++    auto impl = [&](const uint8_t *data, uint32_t sizeBytes) -> void
++    {
+     if (sizeBytes == 0u)
+         return;
++    if (sotc_vif_trace::enabled())
++    {
++        sotc_vif_trace::g_calls.fetch_add(1, std::memory_order_relaxed);
++        sotc_vif_trace::g_bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
++    }
+ 
+     uint32_t pos = 0;
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
+-        {
+-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+-            if (availableQw == 0u)
+-            {
+-                break;
+-            }
+-
+-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+-
+-            pos += chunkQw * 16u;
+-            m_vif1PendingPath2ImageQwc -= chunkQw;
+-            if (m_vif1PendingPath2ImageQwc == 0u)
+-            {
+-                m_vif1PendingPath2DirectHl = false;
+-            }
+-            continue;
+-        }
+-
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
+         pos += 4;
++        const uint32_t cmdStart = pos - 4u;
++        // A VIFcode whose payload continues in the next DMA transfer: keep it and finish it then.
++        auto carryRest = [&]() { g_vif1Carry.assign(data + cmdStart, data + sizeBytes); };
+ 
+         uint8_t opcode = (cmd >> 24) & 0x7F;
++        if (sotc_vif_trace::enabled())
++        {
++            sotc_vif_trace::g_op[opcode].fetch_add(1, std::memory_order_relaxed);
++            static thread_local uint32_t ringCmd[8], ringPos[8];
++            static thread_local unsigned ringN = 0;
++            static std::atomic<int> dumps{0};
++            const bool valid = opcode <= 0x07 || opcode == 0x10 || opcode == 0x11 || opcode == 0x13 || opcode == 0x14 ||
++                               opcode == 0x15 || opcode == 0x17 || opcode == 0x20 || opcode == 0x30 || opcode == 0x31 ||
++                               opcode == 0x4A || opcode == 0x50 || opcode == 0x51 || opcode >= 0x60;
++            if (!valid && dumps.fetch_add(1) < 6)
++            {
++                std::fprintf(stderr, "[VIF1 bad] op=%02x cmd=%08x pos=%u size=%u cycle=%08x prev:", opcode, cmd, pos - 4, sizeBytes, vif1_regs.cycle);
++                for (unsigned k = 0; k < 8 && k < ringN; ++k)
++                {
++                    unsigned i = (ringN - 1 - k) & 7;
++                    std::fprintf(stderr, " [%u]%08x", ringPos[i], ringCmd[i]);
++                }
++                std::fprintf(stderr, "\n  bytes:");
++                const uint32_t from = (pos >= 68u) ? pos - 68u : 0u;
++                for (uint32_t b = from; b < pos + 28u && b + 4u <= sizeBytes; b += 4)
++                {
++                    uint32_t w; std::memcpy(&w, data + b, 4);
++                    std::fprintf(stderr, "%s%08x", (b == pos - 4) ? " >" : " ", w);
++                }
++                std::fprintf(stderr, "\n");
++            }
++            ringCmd[ringN & 7] = cmd; ringPos[ringN & 7] = pos - 4; ++ringN;
++        }
+         uint16_t imm = cmd & 0xFFFF;
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
+@@ -441,7 +486,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_STMASK)
+         {
+             if (pos + 4 > sizeBytes)
+-                break;
++            {
++                carryRest();
++                return;
++            }
+             uint32_t maskValue = 0;
+             std::memcpy(&maskValue, data + pos, sizeof(maskValue));
+             vif1_regs.mask = maskValue;
+@@ -451,7 +499,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_STROW)
+         {
+             if (pos + 16 > sizeBytes)
+-                break;
++            {
++                carryRest();
++                return;
++            }
+             std::memcpy(vif1_regs.row, data + pos, 16);
+             pos += 16;
+             continue;
+@@ -459,7 +510,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_STCOL)
+         {
+             if (pos + 16 > sizeBytes)
+-                break;
++            {
++                carryRest();
++                return;
++            }
+             std::memcpy(vif1_regs.col, data + pos, 16);
+             pos += 16;
+             continue;
+@@ -469,6 +523,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
++            if (pos + mpgBytes > sizeBytes)
++            {
++                carryRest();
++                return;
++            }
++            if (sotc_vif_trace::enabled())
++            {
++                static std::atomic<int> mpgLogs{0};
++                if (mpgLogs.fetch_add(1) < 40)
++                    std::fprintf(stderr, "[VIF1 MPG] dest=0x%X instr=%u pos=%u size=%u fits=%d\n", destAddr, instructionCount, pos, sizeBytes, (int)(pos + mpgBytes <= sizeBytes));
++            }
+             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+             {
+                 uint32_t copyBytes = mpgBytes;
+@@ -492,17 +557,56 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 qwCount = 65536;
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             const bool truncated = qwCount > availableQw;
++            if (truncated && qwCount < 65536u)
++            {
++                carryRest();
++                return;
++            }
+             if (qwCount > availableQw)
+                 qwCount = availableQw;
+ 
+-            if (qwCount > 0)
++            const uint8_t *directData = data + pos;
++            uint32_t directQw = qwCount;
++            // A GIF IMAGE transfer can span several VIF DIRECT commands: the GIFtag arrives in one
++            // DIRECT, the pixel data in the following ones. Real VIF only forwards data via DIRECT,
++            // so continue the pending IMAGE here instead of eating raw words after the tag.
++            if (directQw > 0 && m_vif1PendingPath2ImageQwc != 0u)
++            {
++                const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, directQw);
++                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++                const uint64_t imageTag =
++                    static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++                    ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++                    (static_cast<uint64_t>(kGifFmtImage) << 58);
++                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                std::memcpy(imagePacket.data() + 16u, directData, static_cast<size_t>(chunkQw) * 16u);
++                submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
++                m_vif1PendingPath2ImageQwc -= chunkQw;
++                if (m_vif1PendingPath2ImageQwc == 0u)
++                    m_vif1PendingPath2DirectHl = false;
++                directData += chunkQw * 16u;
++                directQw -= chunkQw;
++            }
++
++            if (directQw > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
++                submitGifPacket(GifPathId::Path2, directData, directQw * 16, true, directHl);
+ 
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
++                const uint32_t pendingImageQw = pendingGifImageQwc(directData, directQw * 16u);
+                 if (pendingImageQw != 0u)
+                 {
++                    static std::atomic<int> idumps{0};
++                    if (sotc_vif_trace::enabled() && idumps.fetch_add(1) < 4)
++                    {
++                        std::fprintf(stderr, "[VIF1 img] direct qw=%u pendingImgQw=%u at pos=%u; next words:", qwCount, pendingImageQw, pos);
++                        for (uint32_t b = pos + qwCount * 16u; b < pos + qwCount * 16u + 40u && b + 4u <= sizeBytes; b += 4)
++                        {
++                            uint32_t w; std::memcpy(&w, data + b, 4);
++                            std::fprintf(stderr, " %08x", w);
++                        }
++                        std::fprintf(stderr, "\n");
++                    }
+                     m_vif1PendingPath2ImageQwc = pendingImageQw;
+                     m_vif1PendingPath2DirectHl = directHl;
+                 }
+@@ -572,6 +676,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+             const bool zeroExtend = (imm & 0x4000u) != 0u;
+ 
++            if (totalBytes > 0 && pos + totalBytes > sizeBytes)
++            {
++                carryRest();
++                return;
++            }
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+                 const uint8_t *srcBase = data + pos;
+@@ -780,4 +889,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+     }
++    };
++    impl(data, sizeBytes);
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..1d2595a 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,7 @@
++#include <mutex>
++#include <map>
++#include <vector>
++#include <atomic>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -22,6 +26,26 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Earliest readyCycle of any pending pipeline entry; lets commitReadyPipelines() skip
++    // its full scan on cycles where nothing can commit. Kept outside the class so the
++    // public header (included by all generated code) stays unchanged.
++    const void *g_vu1CommitOwner = nullptr;
++    uint64_t g_vu1NextCommit = 0;
++
++    inline void vu1NoteReady(const void *owner, uint64_t readyCycle)
++    {
++        if (g_vu1CommitOwner != owner)
++        {
++            g_vu1CommitOwner = owner;
++            g_vu1NextCommit = 0;
++        }
++        else if (readyCycle < g_vu1NextCommit)
++            g_vu1NextCommit = readyCycle;
++    }
++}
++
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+ {
+     if (lanes == 0u)
+@@ -533,6 +557,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    vu1NoteReady(this, entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +597,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +617,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +642,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +657,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    vu1NoteReady(this, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +672,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +690,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            vu1NoteReady(this, store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +712,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +739,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +761,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,10 +778,18 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    if (g_vu1CommitOwner == this && m_cycle < g_vu1NextCommit)
++        return;
++    uint64_t pendingMin = UINT64_MAX;
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid)
++            continue;
++        if (entry.readyCycle > m_cycle)
++        {
++            pendingMin = std::min(pendingMin, entry.readyCycle);
+             continue;
++        }
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -765,6 +807,8 @@ void VU1Interpreter::commitReadyPipelines()
+         entry = {};
+     }
+ 
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        pendingMin = std::min(pendingMin, m_fdiv.readyCycle);
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+     {
+         m_state.q = m_fdiv.value;
+@@ -780,12 +824,19 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.p = entry.value;
+             entry = {};
+         }
++        else if (entry.valid)
++            pendingMin = std::min(pendingMin, entry.readyCycle);
+     }
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid)
+             continue;
++        if (store.readyCycle > m_cycle)
++        {
++            pendingMin = std::min(pendingMin, store.readyCycle);
++            continue;
++        }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -802,8 +853,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pendingMin = std::min(pendingMin, write.readyCycle);
++            continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -817,8 +873,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pendingMin = std::min(pendingMin, write.readyCycle);
+             continue;
++        }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
+@@ -826,8 +887,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pendingMin = std::min(pendingMin, write.readyCycle);
++            continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -838,6 +904,8 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++    g_vu1CommitOwner = this;
++    g_vu1NextCommit = pendingMin;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -926,10 +994,43 @@ void VU1Interpreter::finishXgkick()
+     m_xgkick.active = false;
+ }
+ 
++extern std::atomic<bool> g_ps2xStateHist;
++std::mutex g_ps2xVu1ProgMutex;
++std::map<uint32_t, uint64_t> g_ps2xVu1ProgCount;
++// Diagnostics: when armed (by the game override), dump VU1 code/data/registers at the next few XGKICKs.
++std::atomic<int> g_ps2xVu1DumpArm{0};
++static const uint8_t *g_vu1LastCode = nullptr;
++static uint32_t g_vu1LastCodeSize = 0;
++
+ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+ {
+     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
+         return;
++    if (g_ps2xVu1DumpArm.load(std::memory_order_relaxed) > 0)
++    {
++        static int dumpIndex = 0;
++        const int left = g_ps2xVu1DumpArm.fetch_sub(1);
++        if (left > 0)
++        {
++            char path[96];
++            std::snprintf(path, sizeof(path), "/tmp/vu1dump_%02d.bin", dumpIndex++);
++            if (FILE *f = std::fopen(path, "wb"))
++            {
++                // layout: data(16K) code(16K) vf(32*16) vi(16*4) kickAddr pc
++                std::fwrite(m_activeVuData, 1, std::min<uint32_t>(m_activeVuDataSize, 16384u), f);
++                std::vector<uint8_t> code(16384u, 0u);
++                if (g_vu1LastCode)
++                    std::memcpy(code.data(), g_vu1LastCode, std::min<uint32_t>(g_vu1LastCodeSize, 16384u));
++                std::fwrite(code.data(), 1, code.size(), f);
++                std::fwrite(m_state.vf, 1, sizeof(m_state.vf), f);
++                std::fwrite(m_state.vi, 1, sizeof(m_state.vi), f);
++                const uint32_t extra[2] = {qwordAddress, m_state.pc};
++                std::fwrite(extra, 1, sizeof(extra), f);
++                std::fclose(f);
++                std::fprintf(stderr, "[VU1 dump] %s kick=0x%X pc=0x%X\n", path, qwordAddress, m_state.pc);
++            }
++        }
++    }
+ 
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+     m_xgkick = {};
+@@ -1590,6 +1691,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
+ {
++    if (m_unit == Unit::VU1 && g_ps2xStateHist.load(std::memory_order_relaxed))
++    {
++        std::lock_guard<std::mutex> lock(g_ps2xVu1ProgMutex);
++        ++g_ps2xVu1ProgCount[startPC & microAddressMask()];
++    }
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+     m_state.ebit = false;
+@@ -1628,6 +1734,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+     m_activeMemory = memory;
++    g_vu1LastCode = vuCode;
++    g_vu1LastCodeSize = codeSize;
+ 
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
