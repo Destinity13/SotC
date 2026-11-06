@@ -184,6 +184,24 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [doc
 
 ---
 
+## Texture packs: making them fast
+
+Upscaled PCSX2 texture packs often slow PCSX2 down far more than their size suggests. Two causes were found and
+fixed with tools in this repo (they work for any PCSX2 pack, not just this game):
+
+1. **Alpha overshoot.** On the PS2, alpha 128 means fully opaque. Upscalers sharpen alpha edges to 129–135; PCSX2 then
+   tracks the render target as "alpha > 1.0" and pushes every later draw that reads destination alpha through the
+   shader path with a barrier per draw (3–8× draw calls/barriers). `tools/dds_alpha_fix.py` clamps such overshoot back
+   to 128 (only where ≤ 1 % of pixels exceed 140, so genuinely bright alpha stays). Result here: 85.6 → **88.2 FPS**
+   (88.8 without any pack), the title menu went from 39–54 to 77–84 FPS, and the image is visually identical.
+2. **Replaced palette textures with animated CLUTs.** Replacing a paletted texture makes PCSX2 disable GPU palette
+   conversion for *all* palette variants of it; distance-fade palettes then convert every variant on the CPU. A per-pack
+   `.ausschluss.txt` (exclude list) skips those few textures.
+
+Also: `dds_mipmaps.py` adds the missing mip chain to BC3/BC7 packs (level 0 bit-identical), `png2dds.py` converts large
+PNGs to BC7 with mips, `dds_alpha.py` precomputes the alpha range so PCSX2 no longer decompresses every 4K texture on
+the CPU when loading (patched loader in `gsbridge/`).
+
 ## Installing (Linux)
 
 After building (see below), one command adds the game to your desktop:

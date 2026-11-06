@@ -321,6 +321,14 @@ void Host::BeginPresentFrame()
 
 		s_total_frames++;
 
+		// PS2XGS_STAT=1: alle 50 Bilder die PCSX2-Zaehler ausgeben (Draws, Render-Paesse, Barrieren, Kopien, Uploads, Rueckleser)
+		static const bool statOn = [] { const char* e = std::getenv("PS2XGS_STAT"); return e && *e == '1'; }();
+		if (statOn && (s_total_frames % 50) == 0)
+			Console.WriteLn("[ps2xgs-stat] frames=%llu draws=%llu calls=%llu passes=%llu barriers=%llu copies=%llu uploads=%llu readbacks=%llu",
+				(unsigned long long)s_total_frames, (unsigned long long)s_total_internal_draws, (unsigned long long)s_total_draws,
+				(unsigned long long)s_total_render_passes, (unsigned long long)s_total_barriers, (unsigned long long)s_total_copies,
+				(unsigned long long)s_total_uploads, (unsigned long long)s_total_readbacks);
+
 		std::atomic_thread_fence(std::memory_order_release);
 	}
 }
@@ -1207,6 +1215,8 @@ static std::atomic<bool> s_shutdown_requested{false};
 #include "pcsx2/GS/Renderers/HW/GSTextureReplacements.h"
 #include "pcsx2/GS/Renderers/Common/GSRenderer.h"
 #include <filesystem>
+#include <set>
+#include <fstream>
 #include <vector>
 #include <fstream>
 #include <sys/stat.h>
@@ -1229,6 +1239,8 @@ namespace ps2xmenu
 		int upscale = 4, aspect = 0, cas = 1, casSharp = 25, tv = 0, filter = 2, aniso = 16, dither = 0;
 		int sbB = 50, sbC = 50, sbS = 50, rumblePct = 100, hz = 50, volume = 100, camBlur = 1;
 		bool fxaa = false, shadeboost = false, fullscreen = false, showFps = false, rumble = true, vsync = false, startMenu = true;
+		int tri = 2;             // Trilineare Filterung: 0 automatisch (PCSX2-Standard), 1 wie PS2, 2 erzwungen (nutzt Mipmaps der Ersatztexturen)
+		int fx = 0;              // Effekte (vkBasalt): 0 aus, 1 original-plus, 2 klar, 3 filmisch - wirkt beim naechsten Start
 		bool hdText = true;      // Neusatz der Textseiten (TeX Gyre), hat Vorrang vor Paketen
 		std::string packs = "*"; // aktive Texturpakete ("*" = alle vorhandenen, Voreinstellung) (Ordnernamen in texturquellen/, durch Komma, Reihenfolge = Prioritaet)
 	};
@@ -1288,6 +1300,8 @@ namespace ps2xmenu
 			else if (k == "lautstaerke") cfg.volume = std::clamp(v, 0, 200);
 			else if (k == "kamera_unschaerfe") cfg.camBlur = v != 0 ? 1 : 0;
 			else if (k == "hd_text") cfg.hdText = v != 0;
+			else if (k == "trilinear") cfg.tri = std::clamp(v, 0, 2);
+			else if (k == "effekte") { const std::string val = line.substr(eq + 1); cfg.fx = val == "original-plus" ? 1 : val == "klar" ? 2 : val == "filmisch" ? 3 : 0; }
 			else if (k == "texturpakete") cfg.packs = line.substr(eq + 1);
 		}
 	}
@@ -1301,7 +1315,7 @@ namespace ps2xmenu
 		  << "\ncas_staerke=" << c.casSharp << "\ndithering=" << c.dither << "\ntv_shader=" << c.tv << "\nfarbe=" << c.shadeboost << "\nhelligkeit=" << c.sbB
 		  << "\nkontrast=" << c.sbC << "\nsaettigung=" << c.sbS << "\ntexturfilter=" << c.filter << "\nanisotrop=" << c.aniso
 		  << "\nvollbild=" << c.fullscreen << "\nfps_anzeige=" << c.showFps << "\nvibration=" << c.rumble
-		  << "\nvibration_staerke=" << c.rumblePct << "\nvsync=" << c.vsync << "\nbildrate=" << c.hz << "\nlautstaerke=" << c.volume << "\nkamera_unschaerfe=" << c.camBlur << "\nstartmenue=" << c.startMenu << "\nhd_text=" << c.hdText << "\ntexturpakete=" << c.packs << "\n";
+		  << "\nvibration_staerke=" << c.rumblePct << "\nvsync=" << c.vsync << "\nbildrate=" << c.hz << "\nlautstaerke=" << c.volume << "\nkamera_unschaerfe=" << c.camBlur << "\nstartmenue=" << c.startMenu << "\neffekte=" << (c.fx == 1 ? "original-plus" : c.fx == 2 ? "klar" : c.fx == 3 ? "filmisch" : "aus") << "\ntrilinear=" << c.tri << "\nhd_text=" << c.hdText << "\ntexturpakete=" << c.packs << "\n";
 	}
 	// ---------- Texturquellen (HD-Text + Pakete) -> zusammengesetzter Ersatzordner ----------
 	// Quellen: <dir>/texturquellen/<name>/... (hd-text = unser Neusatz; Pakete werden von "SotC starten" aus
@@ -1351,18 +1365,29 @@ namespace ps2xmenu
 		       a.aniso == b.aniso && a.dither == b.dither && a.sbB == b.sbB && a.sbC == b.sbC && a.sbS == b.sbS && a.rumblePct == b.rumblePct &&
 		       a.hz == b.hz && a.volume == b.volume && a.camBlur == b.camBlur && a.fxaa == b.fxaa && a.shadeboost == b.shadeboost &&
 		       a.fullscreen == b.fullscreen && a.showFps == b.showFps && a.rumble == b.rumble && a.vsync == b.vsync && a.startMenu == b.startMenu &&
-		       a.hdText == b.hdText && a.packs == b.packs;
+		       a.hdText == b.hdText && a.packs == b.packs && a.fx == b.fx && a.tri == b.tri;
 	}
 	static void linkTree(const std::filesystem::path& src, const std::filesystem::path& dst, unsigned& n)
 	{
 		std::error_code ec;
+		// <quelle>/.ausschluss.txt: Dateinamen, die nicht ersetzt werden (z. B. Palettentexturen, deren Ersatz PCSX2 in
+		// den langsamen Pfad zwingt: jede Palettenvariante einzeln umgewandelt -> Draw-Calls x3..x8)
+		std::set<std::string> aus;
+		{
+			std::ifstream f((src / ".ausschluss.txt").string());
+			std::string l;
+			while (std::getline(f, l))
+				if (!l.empty() && l[0] != '#') { while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back(); aus.insert(l); }
+		}
 		for (const auto& e : std::filesystem::recursive_directory_iterator(src, std::filesystem::directory_options::follow_directory_symlink, ec))
 		{
 			if (!e.is_regular_file(ec)) continue;
 			std::string ext = e.path().extension().string();
 			std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 			if (ext != ".png" && ext != ".dds") continue;
+			if (aus.count(e.path().filename().string())) continue;
 			const auto to = dst / e.path().filename();
+			// Alpha-Zusatzdatei (tools/dds_alpha.py) wird ueber den echten Pfad gelesen, kein eigener Verweis noetig
 			std::filesystem::remove(to, ec);
 			std::filesystem::create_symlink(std::filesystem::absolute(e.path()), to, ec);
 			if (!ec) ++n;
@@ -1419,6 +1444,7 @@ namespace ps2xmenu
 		si.SetIntValue("EmuCore/GS", "ShadeBoost_Saturation", c.sbS);
 		si.SetIntValue("EmuCore/GS", "filter", c.filter);
 		si.SetIntValue("EmuCore/GS", "MaxAnisotropy", c.aniso);
+		si.SetIntValue("EmuCore/GS", "TriFilter", c.tri == 0 ? -1 : c.tri == 1 ? 1 : 2); // TriFiltering: Automatic/PS2/Forced
 		si.SetBoolValue("EmuCore/GS", "OsdShowFPS", c.showFps);
 		si.SetIntValue("EmuCore/GS", "OsdPerformancePos", c.showFps ? 3 : 0);
 		si.SetIntValue("EmuCore/GS", "VsyncEnable", c.vsync ? 1 : 0);
@@ -1590,6 +1616,8 @@ namespace ps2xmenu
 				static const char* kAni[] = {"Aus", "2x", "4x", "8x", "16x"};
 				int ai = c.aniso == 0 ? 0 : c.aniso == 2 ? 1 : c.aniso == 4 ? 2 : c.aniso == 8 ? 3 : 4;
 				if (combo("Anisotrope Filterung", &ai, kAni, 5)) c.aniso = ai == 0 ? 0 : (1 << ai);
+				static const char* kTri[] = {"Automatisch", "Wie PS2", "Erzwungen (empfohlen mit Texturpaketen)"};
+				combo("Trilineare Filterung", &c.tri, kTri, 3);
 				{
 					ImGui::TextColored(ImVec4(0.96f, 0.86f, 0.60f, 1.0f), "60 FPS:");
 					ImGui::SameLine();
@@ -1621,6 +1649,11 @@ namespace ps2xmenu
 					ImGui::SliderInt("Saettigung", &c.sbS, 1, 100);
 					if (ImGui::Button("Farben zuruecksetzen")) { c.sbB = c.sbC = c.sbS = 50; }
 				}
+				ImGui::Separator();
+				static const char* kFx[] = {"Aus", "Original+ (nur SMAA)", "Klar (SMAA + Schaerfe + Kontrast)", "Filmisch (SMAA + Schaerfe + Farblook)"};
+				combo("Effekte (vkBasalt)", &c.fx, kFx, 4);
+				ImGui::TextDisabled("Wirkt beim naechsten Spielstart. Im Spiel: Pos1-Taste schaltet die Effekte an/aus.");
+				ImGui::TextDisabled("Benoetigt vkBasalt (CachyOS: sudo pacman -S vkbasalt).");
 				ImGui::EndTabItem();
 			}
 			if (ImGui::BeginTabItem("Ton"))
@@ -2224,7 +2257,7 @@ PS2XGS_API int ps2xgs_start(const char* live_path, int renderer, float upscale, 
 		EmuFolders::Textures = tex; // wurde schon beim Start aus der PCSX2-Konfiguration gesetzt
 		{ const unsigned n = ps2xmenu::assembleTextures(); if (n) Console.WriteLn("[ps2x] Texturen: %u Ersatzdateien aktiv (HD-Text/Pakete)", n); }
 		s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacements", true);
-		s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacementsAsync", false); // kein Aufploppen
+		s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacementsAsync", true); // nie im Grafik-Thread laden (Ruckler); Aufploppen verhindert das Vorladen beim Start
 		s_settings_interface.SetBoolValue("EmuCore/GS", "PrecacheTextureReplacements", true);
 		const char* dump = std::getenv("PS2XGS_TEXDUMP");
 		const bool d = dump && *dump == '1';
@@ -2258,6 +2291,21 @@ PS2XGS_API void ps2xgs_flush()
 
 PS2XGS_API void ps2xgs_vsync(const unsigned char* regs0x2000, int field)
 {
+	// Vorladen der Ersatztexturen (Texturpakete): beim Start einmal warten, bis der Lade-Thread fertig ist, statt
+	// die ersten Minuten im Menue nachzuladen (das ruckelte). Hoechstens 45 s; PS2XGS_TEX_WARTEN=0 schaltet es ab.
+	static unsigned s_vsyncs = 0;
+	if (++s_vsyncs == 20)
+	{
+		static const bool warten = [] { const char* e = std::getenv("PS2XGS_TEX_WARTEN"); return !(e && *e == '0'); }();
+		const unsigned pending = GSTextureReplacements::PendingWorkerItems();
+		if (warten && pending > 0)
+		{
+			const auto t0 = std::chrono::steady_clock::now();
+			const bool ok = GSTextureReplacements::WaitForWorkerIdle(45000);
+			Console.WriteLn("[ps2x] Texturen vorgeladen: %u Dateien in %.1f s%s", pending,
+				std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ok ? "" : " (Zeitlimit)");
+		}
+	}
 	GSDumpReplayer::LivePush(3, 0, regs0x2000, 0x2000);
 	GSDumpReplayer::LivePush(1, static_cast<u8>(field), nullptr, 0);
 }

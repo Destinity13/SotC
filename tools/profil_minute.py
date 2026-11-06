@@ -20,6 +20,9 @@ def main():
     k2, b = lade(os.path.join(ordner, 'profil_m%03u.txt' % bis))
     diff = {k: v - a.get(k, 0) for k, v in b.items() if v - a.get(k, 0) > 0}
     binp = open(os.path.join(ordner, 'binary.txt')).read().strip()
+    if not os.path.exists(binp):  # anderer Rechnerpfad (z. B. Sitzungs-VM): gleiche Datei unter build/sotc suchen
+        alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'build', 'sotc', os.path.basename(binp))
+        if os.path.exists(alt): binp = alt
     # Symbol-Binary: die PGO-Ausgabe hat Symbole; die kopierte Spieler-Binary ist identisch gebaut
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
         f.writelines(l.replace('proben', 'proben') for l in k2)

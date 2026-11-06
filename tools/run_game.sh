@@ -25,7 +25,7 @@ for f in "$ROOT"/extracted/*; do
     ln -sfn "$f" "$RUN/$name"
 done
 cp -f "$ROOT/elf/sotc_linked.elf" "$RUN/SCES_533.26"
-BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc162}"   # aktuelle Binary (pc162: statische VU1-Taktplanung Stufe 1+2, VU1 -25 %; pc159: CRC-Schluessel statt FNV je Upload; pc158: Spielprofil je Minute; pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
+BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc163}"   # aktuelle Binary (pc163: getenv nur einmal; pc162: statische VU1-Taktplanung Stufe 1+2, VU1 -25 %; pc159: CRC-Schluessel statt FNV je Upload; pc158: Spielprofil je Minute; pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
 if [ ! -x "$BIN" ] && [ -f "$BIN.xz" ]; then
     echo "==> Entpacke vorgebaute Binary"
     xz -dkf "$BIN.xz" && chmod +x "$BIN"
@@ -55,7 +55,7 @@ export PS2X_EE_ROUND="${PS2X_EE_ROUND:-chop_daz}"
 export PS2X_VBLANK_HZ="${PS2X_VBLANK_HZ:-$HZ_INI}"   # PAL SCES-53326: 50 Hz wie PS2/PCSX2 (Partikel-Zeitschritt bitgleich 0.0196608); "60" fuer NTSC-Takt
 # VU1-Code mitschneiden, den der Uebersetzer noch nicht kennt (neue Gebiete/Kolosse): beim Spielen wird nur selten
 # geschrieben (alle ~2 min); die Daten fliessen in den naechsten Build ein (tools/vu1dump_merge.py).
-if [ -z "${PS2X_VU1_DUMP+x}" ] && [ "${SOTC_VU1_MITSCHNITT:-1}" = 1 ]; then  # ab pc149 (vorher schaltete der Mitschnitt den VU1-Uebersetzer ab); aus: SOTC_VU1_MITSCHNITT=0
+if [ -z "${PS2X_VU1_DUMP+x}" ] && [ "${SOTC_VU1_MITSCHNITT:-0}" = 1 ]; then  # nur bei Bedarf (SOTC_VU1_MITSCHNITT=1): seit pc154 sind alle Module statisch uebersetzt, der Mitschnitt kostet je VU1-Aufruf Zeit
     export PS2X_VU1_DUMP="$ROOT/build/vu1dump_spiel"
     export PS2X_VU1_DUMP_EVERY="${PS2X_VU1_DUMP_EVERY:-262144}"
 fi
@@ -76,6 +76,19 @@ if [ -z "${SOTC_PROFILE+x}" ]; then
     export SOTC_PROFILE=2000 SOTC_PROFILE_MINUTEN=1
     export SOTC_PROFILE_DIR="$ROOT/build/spiel_profil/$(date +%F_%H%M)"
     mkdir -p "$SOTC_PROFILE_DIR"; echo "$BIN" > "$SOTC_PROFILE_DIR/binary.txt"
+fi
+# Effekte im ReShade-Stil ueber vkBasalt (Spielmenue -> Bild & Shader -> "Effekte", wirkt beim naechsten Start;
+# im Spiel schaltet die Pos1-Taste sie live an/aus). Voreinstellungen in tools/effekte/ (eingebaute vkBasalt-Effekte).
+_cfgini="${PS2XGS_CFG:-${XDG_CONFIG_HOME:-$HOME/.config}/sotc-recomp/einstellungen.ini}"
+_fx="$(sed -n 's/^effekte=\([a-z-]*\).*/\1/p' "$_cfgini" 2>/dev/null | tail -1)"
+if [ -n "$_fx" ] && [ "$_fx" != aus ] && [ -f "$ROOT/tools/effekte/$_fx.conf" ] && [ -z "${ENABLE_VKBASALT+x}" ]; then
+    if ls /usr/lib/libvkbasalt.so /usr/lib64/libvkbasalt.so /usr/lib/x86_64-linux-gnu/libvkbasalt.so 2>/dev/null | grep -q .; then
+        _fxcfg="${XDG_CONFIG_HOME:-$HOME/.config}/sotc-recomp/vkbasalt.conf"
+        sed "s#@DIR@#$ROOT/tools/effekte#g" "$ROOT/tools/effekte/$_fx.conf" > "$_fxcfg"
+        export ENABLE_VKBASALT=1 VKBASALT_CONFIG_FILE="$_fxcfg"
+    else
+        echo "[SotC] Effekte '$_fx' gewaehlt, aber vkBasalt ist nicht installiert (sudo pacman -S vkbasalt)" >&2
+    fi
 fi
 export SOTC_MEMCARD="${SOTC_MEMCARD:-$ROOT/build/Mcd001.ps2}"
 # Speicherkarte: bei jedem Start eine Tageskopie (build/speicherkarten_sicherung/Mcd001_JJJJ-MM-TT.ps2)

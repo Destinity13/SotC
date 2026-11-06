@@ -111,6 +111,94 @@ index e8b9f37..71fb744 100644
  					}
  
  					// all data available? usually is
+diff --git a/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp b/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
+index 41c98ca..1966c47 100644
+--- a/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
++++ b/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
++#include <cstdlib>
++#include <chrono>
++#include <thread>
++#include <cstdio>
+ #include "common/AlignedMalloc.h"
+ #include "common/Console.h"
+ #include "common/HashCombine.h"
+@@ -642,7 +646,28 @@ std::optional<GSTextureReplacements::ReplacementTexture> GSTextureReplacements::
+ 		return std::nullopt;
+ 	}
+ 
+-	SetReplacementTextureAlphaMinMax(rtex);
++	// ps2x: Alpha-Bereich komprimierter Texturen aus einer vorab berechneten Zusatzdatei <echte Datei>.alpha (2 Bytes
++	// min/max, erzeugt von tools/dds_mipmaps.py). Sonst entpackt PCSX2 hier jede 4K-Textur komplett auf der CPU -
++	// bei grossen Paketen Ruckeln im Grafik-Thread (Titelbild) und minutenlanges Vorladen.
++	bool fromSidecar = false;
++	if (rtex.format != GSTexture::Format::Color)
++	{
++		char real[4096];
++		const char* rp = realpath(filename.c_str(), real);
++		const std::string side = std::string(rp ? rp : filename.c_str()) + ".alpha";
++		if (std::FILE* f = std::fopen(side.c_str(), "rb"))
++		{
++			u8 v[2];
++			if (std::fread(v, 1, 2, f) == 2)
++			{
++				rtex.alpha_minmax = std::make_pair(v[0], v[1]);
++				fromSidecar = true;
++			}
++			std::fclose(f);
++		}
++	}
++	if (!fromSidecar)
++		SetReplacementTextureAlphaMinMax(rtex);
+ 
+ 	return rtex;
+ }
+@@ -969,6 +994,28 @@ void GSTextureReplacements::SyncWorkerThread()
+ 	}
+ }
+ 
++bool GSTextureReplacements::WaitForWorkerIdle(unsigned timeout_ms)
++{
++	const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
++	for (;;)
++	{
++		{
++			std::unique_lock<std::mutex> lock(s_worker_thread_mutex);
++			if (!s_worker_thread.joinable() || s_worker_thread_queue.empty())
++				return true;
++		}
++		if (std::chrono::steady_clock::now() >= end)
++			return false;
++		std::this_thread::sleep_for(std::chrono::milliseconds(5));
++	}
++}
++
++unsigned GSTextureReplacements::PendingWorkerItems()
++{
++	std::unique_lock<std::mutex> lock(s_worker_thread_mutex);
++	return static_cast<unsigned>(s_worker_thread_queue.size());
++}
++
+ void GSTextureReplacements::CancelPendingLoadsAndDumps()
+ {
+ 	std::unique_lock<std::mutex> lock(s_worker_thread_mutex);
+diff --git a/pcsx2/GS/Renderers/HW/GSTextureReplacements.h b/pcsx2/GS/Renderers/HW/GSTextureReplacements.h
+index ef176ed..a493d32 100644
+--- a/pcsx2/GS/Renderers/HW/GSTextureReplacements.h
++++ b/pcsx2/GS/Renderers/HW/GSTextureReplacements.h
+@@ -42,6 +42,9 @@ namespace GSTextureReplacements
+ 	GSTexture* LookupReplacementTexture(const GSTextureCache::HashCacheKey& hash, bool mipmap, bool* pending, std::pair<u8, u8>* alpha_minmax);
+ 	GSTexture* CreateReplacementTexture(const ReplacementTexture& rtex, bool mipmap);
+ 	void ProcessAsyncLoadedTextures();
++	// ps2x: wartet, bis der Lade-Thread alle vorgemerkten Ersatztexturen geladen hat (Vorladen beim Start), hoechstens timeout_ms
++	bool WaitForWorkerIdle(unsigned timeout_ms);
++	unsigned PendingWorkerItems();
+ 
+ 	void DumpTexture(const GSTextureCache::HashCacheKey& hash, const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA,
+ 		GSTextureCache::SourceRegion region, GSLocalMemory& mem, u32 level);
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
 index 9c31bb8..3c1c9ac 100644
 --- a/pcsx2/GSDumpReplayer.cpp

@@ -2033,7 +2033,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     if (m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code())
     {
         static std::atomic<bool> s_stStarted{false};
-        const char *sdEnv = std::getenv("PS2X_VU1_SELFTEST");
+        static const char *const sdEnv = std::getenv("PS2X_VU1_SELFTEST"); // einmal lesen (execute laeuft >2000x je Bild)
         if (sdEnv && *sdEnv && !s_stStarted.exchange(true)) [&] { // verschachtelte execute()-Aufrufe des Tests laufen normal
             const char *sd = sdEnv;
             const int seeds = [] { const char *e = std::getenv("PS2X_VU1_SELFTEST_N"); return (e && *e) ? std::max(1, std::atoi(e)) : 8; }();
