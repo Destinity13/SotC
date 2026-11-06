@@ -59,7 +59,7 @@ if [ -z "${PS2X_VU1_DUMP+x}" ] && [ "${SOTC_VU1_MITSCHNITT:-0}" = 1 ]; then  # n
     export PS2X_VU1_DUMP="$ROOT/build/vu1dump_spiel"
     export PS2X_VU1_DUMP_EVERY="${PS2X_VU1_DUMP_EVERY:-262144}"
 fi
-[ -n "$PS2X_VU1_DUMP" ] && mkdir -p "$PS2X_VU1_DUMP"
+[ -n "${PS2X_VU1_DUMP:-}" ] && mkdir -p "$PS2X_VU1_DUMP"
 # Texturen: Quellen in build/texturquellen/<Name>/ (Spielmenue -> Texturen schaltet sie an/aus, HD-Text hat Vorrang).
 #   hd-text          = unser Neusatz der Menue-/Untertitelseiten (TeX Gyre, kein KI-Upscaling)
 #   origami-remaster = Texturpaket von Sad Origami (PAL), importiert aus texturpakete/
