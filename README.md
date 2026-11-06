@@ -99,6 +99,22 @@ Some of the things that were found by comparing against the reference instead of
 <br><sub>Left: original 128–512 px texture pages as the game ships them. Right: the same pages re-typeset at 4× (TeX Gyre Heros / TeX Gyre Chorus), button icons kept from the original.</sub>
 </div>
 
+
+### VU1 optimisation log (one day, every step bit-exact)
+
+Every step is accepted only if a differential run against the cycle-accurate interpreter shows **0 mismatches
+over 7.26 million VU1 program invocations** and 36/36 regression screenshots are pixel-identical.
+
+| Step | VU1 thread CPU time | |
+|---|---|---|
+| Baseline (stage-5 compiler) | 83.2 s | |
+| Remaining lower ops translated directly (DIV/RSQRT/SQRT/WAITQ, clip/status/MAC flag tests, MTIR/MFIR/ILWR/XTOP) — 389 interpreter fallbacks in the hot path → 0 | 76.7 s | −8 % |
+| Leaner bookkeeping: no upper-opcode tracking in the fast path, dominated "pending result" updates removed per block, branch-VI backup inline | 72.6 s | −13 % |
+| Cycle skipping to the next pipeline event; XGKICK copies whole GIF tag payloads instead of 16 bytes at a time | 70.1 s | −16 % |
+| Tried and rejected: a leaner FMAC core with normalised register shadows ("stage 6") — correct, but 8–15 % *slower* (code size / spills) | 89.8–95.6 s | ✗ |
+
+Measured with the thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`), solo, same replay, no PGO noise.
+
 ---
 
 ## Findings and fixes in other projects
@@ -152,11 +168,11 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [doc
 | | |
 |---|---|
 | Project start | 1 November 2026 |
-| Builds | 157 numbered runtime builds (`pc1` … `pc127`), with profile-guided optimisation |
+| Builds | 170+ numbered runtime builds (`pc1` … `pc138`), with profile-guided optimisation |
 | Test runs | 1,231 automated runs through the job queue (replays, differential VU1 tests, RAM comparisons, PCSX2 reference runs), up to 28 in parallel |
 | Reference comparisons | PCSX2 2.8.2 driven by a virtual game pad over PINE, savestates compared word by word |
 | Development machine | AMD Ryzen 9 7950X · AMD Radeon RX 7900 XT · CachyOS (Linux, KDE Plasma / Wayland) |
-| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution; VU1 emulation is the current bottleneck (~14 ms/frame at the worst), see [What's next](#whats-next) |
+| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution. Unpaced benchmark (5,500-frame open-world replay): **62.5 FPS**, VU1 thread **72 s CPU** — down from 83 s the same morning through four bit-exact compiler/runtime steps (see below) |
 
 ---
 
