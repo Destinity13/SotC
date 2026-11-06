@@ -1367,7 +1367,21 @@ namespace ps2xmenu
 		       a.fullscreen == b.fullscreen && a.showFps == b.showFps && a.rumble == b.rumble && a.vsync == b.vsync && a.startMenu == b.startMenu &&
 		       a.hdText == b.hdText && a.packs == b.packs && a.fx == b.fx && a.tri == b.tri;
 	}
-	static void linkTree(const std::filesystem::path& src, const std::filesystem::path& dst, unsigned& n)
+	// Schluessel wie PCSX2 ihn beim Laden bildet: "<TEX0-Hash>-<CLUT-Hash>-<Bits>" ohne das alte TCC-Bit (0x4000),
+	// das aeltere Pakete noch im Namen tragen (RemoveUnusedBits). Gleiche Schluessel = dieselbe Textur.
+	static std::string texKey(const std::string& file)
+	{
+		const auto dot = file.find('.');
+		std::string base = file.substr(0, dot);
+		const auto d = base.rfind('-');
+		if (d == std::string::npos) return base;
+		unsigned long bits = std::strtoul(base.c_str() + d + 1, nullptr, 16) & ~0x4000ul;
+		char b[16]; std::snprintf(b, sizeof(b), "%08lx", bits);
+		return base.substr(0, d + 1) + b;
+	}
+	// keys: bereits belegte Texturen (Pakete zuerst); eine Quelle mit nurNeue=true fuellt nur Luecken.
+	static void linkTree(const std::filesystem::path& src, const std::filesystem::path& dst, unsigned& n,
+		std::set<std::string>& keys, bool nurNeue = false)
 	{
 		std::error_code ec;
 		// <quelle>/.ausschluss.txt: Dateinamen, die nicht ersetzt werden (z. B. Palettentexturen, deren Ersatz PCSX2 in
@@ -1386,6 +1400,9 @@ namespace ps2xmenu
 			std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 			if (ext != ".png" && ext != ".dds") continue;
 			if (aus.count(e.path().filename().string())) continue;
+			const std::string key = texKey(e.path().filename().string());
+			if (nurNeue && keys.count(key)) continue;
+			keys.insert(key);
 			const auto to = dst / e.path().filename();
 			// Alpha-Zusatzdatei (tools/dds_alpha.py) wird ueber den echten Pfad gelesen, kein eigener Verweis noetig
 			std::filesystem::remove(to, ec);
@@ -1416,8 +1433,11 @@ namespace ps2xmenu
 		unsigned n = 0;
 		const auto q = std::filesystem::path(quellenDir());
 		std::string pk; bool hd; { std::lock_guard<std::mutex> lk(m); pk = cfg.packs; hd = cfg.hdText; }
-		for (const auto& name : activePacks(pk)) linkTree(q / name, dst, n);
-		if (hd) linkTree(q / "hd-text", dst, n);
+		// Pakete zuerst: bringen sie eine Textseite selbst mit (z. B. Origami: alle Sprachen, Originalschrift),
+		// gewinnt das Paket; unser Neusatz fuellt nur Seiten, die kein aktives Paket abdeckt.
+		std::set<std::string> keys;
+		for (const auto& name : activePacks(pk)) linkTree(q / name, dst, n, keys);
+		if (hd) linkTree(q / "hd-text", dst, n, keys, true);
 		return n;
 	}
 	// in die PCSX2-Einstellungen uebertragen (CPU-Thread bzw. vor dem Start)
@@ -1679,7 +1699,7 @@ namespace ps2xmenu
 				static std::vector<std::string> quellen; static double lastScan = -1e9;
 				if (ImGui::GetTime() - lastScan > 2.0) { quellen = listSources(); lastScan = ImGui::GetTime(); }
 				static unsigned linked = 0; static bool dirty = false;
-				if (ImGui::Checkbox("HD-Text (Neusatz der Menue- und Untertiteltexte)", &c.hdText)) dirty = true;
+				if (ImGui::Checkbox("HD-Text (eigener Neusatz, fuer Textseiten ohne Paket)", &c.hdText)) dirty = true;
 				ImGui::Separator();
 				ImGui::Text("Texturpakete (PCSX2-Format, z. B. Origami Remaster PAL, Panda_Venom EU):");
 				const auto act = activePacks(c.packs);

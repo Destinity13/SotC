@@ -2,7 +2,7 @@
 
 # Known issues
 
-An honest list, as of November 2026 (runtime build `pc163`).
+An honest list, as of November 2026 (runtime build `pc164`).
 
 ## Open
 
@@ -11,8 +11,11 @@ An honest list, as of November 2026 (runtime build `pc163`).
 - **Texture packs cost a little more GPU work in the open world** than no pack (≈ 2–4× the render-pass barriers of
   the baseline, after the fixes in [PERFORMANCE.md](PERFORMANCE.md#texture-packs-making-them-fast)). Not visible
   as a frame-rate drop on the development machine.
-- **HD text** covers only the pages seen so far (language select, title/bonus menus, 50/60 Hz notice, first
-  tutorial boxes, first subtitles) and only German. Other languages and later pages show the original textures.
+- **HD text without a texture pack** covers only our own re-typeset German pages (language select, title/bonus
+  menus, 50/60 Hz notice, first tutorial boxes, first subtitles). With a pack that ships text pages (Origami: all
+  5 languages), the pack's pages are used everywhere.
+- **Determinism under heavy load:** one of six replays of a regression route diverged after ~1,400 frames while
+  five other runs used the machine; the five repeats were bit-identical. Under investigation.
 - **Changing texture settings in the in-game menu reloads all textures**, which pauses the game for a few seconds
   with a large pack.
 - The **built-in differential VU1 self-test** (`PS2X_VU1_SELFTEST`) reports false mismatches with the static cycle
@@ -33,4 +36,5 @@ An honest list, as of November 2026 (runtime build `pc163`).
 | `pc154` | all VU1 code compiled statically | modules read from the game files, reachability like PCSX2's microVU, 11 → 21 programs compiled |
 | `pc157` | colossus frame drops after a few minutes | stale code from previously loaded modules leaked into the program signatures; signatures now cover only the module and the shared library |
 | `pc163` | title menu at 39–54 FPS with a texture pack | PS2 alpha overshoot in the pack + replaced palette textures; see [PERFORMANCE.md](PERFORMANCE.md#texture-packs-making-them-fast) |
+| `pc164` | warnings for syscalls 13/14 at boot | `SetVTLBRefillHandler` / `SetVCommonHandler` now behave like the BIOS (store per cause, return the previous handler) |
 | `pc163` | small per-call overhead in the VU1 path | an environment variable was read on every VU1 call; the play-time VU1 recording was on by default |

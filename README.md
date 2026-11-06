@@ -70,7 +70,7 @@ fonts (TeX Gyre Heros / Chorus) in the original layout; button icons kept.</sub>
 | 🚀 **Fast** | One frame per VBlank: 60 FPS (NTSC mode) / 50 FPS (PAL). Unpaced: **~88 FPS** at 4× with the HD pack. VU1 thread time cut **83 s → 43 s** in bit-exact steps. → [PERFORMANCE](docs/PERFORMANCE.md) |
 | 🎨 **PCSX2's renderer, in-process** | Only the GS (Vulkan) and SPU2 come from PCSX2, linked as a library — none of its CPU emulation runs. → [`gsbridge/`](gsbridge/) |
 | 🖼️ **Texture packs at full speed** | PCSX2-format packs load directly. Two generic slowdowns found in PCSX2 packs (PS2 alpha overshoot, replaced palette textures) and fixed with tools that work for any game. |
-| 🔤 **HD text** | Menu, subtitle and tutorial textures re-typeset at 4× — sharp text without AI. |
+| 🔤 **HD text** | Text pages from the texture pack (all languages) or our own 4× re-typeset pages — sharp text without AI upscaling of the frame. |
 | 🎛️ **In-game menu** | Resolution, filtering, FXAA/CAS, texture packs and HD text switchable live; optional ReShade-style looks via vkBasalt. |
 | 🐧 **Linux installer** | One script: menu entry with icon, disc-image picker, texture-pack import. |
 
@@ -86,7 +86,7 @@ fonts (TeX Gyre Heros / Chorus) in the original layout; button icons kept.</sub>
 | Sound & music (SPU2 + real IOP sound driver) | ✅ | |
 | 60 Hz mode | ✅ | |
 | Texture packs | ✅ | full speed, live switching in the *Textures* tab |
-| HD text | 🚧 | German intro/menu/tutorial pages done; other languages and later pages pending |
+| HD text | ✅ | packs that ship text pages (Origami: menus + subtitles in all 5 languages) take priority; our own re-typeset German pages fill in when no pack covers a page |
 | In-game settings menu, effects | 🚧 | graphics, textures and effects done; more to come |
 | Linux installer | 🚧 | works, being polished |
 | Rumble | ⬜ | planned |
@@ -149,7 +149,6 @@ Generated code is produced on your machine and never committed.
 ## 🧭 What's next
 
 - More VU1 headroom for the heaviest colossus moments.
-- HD text for the remaining pages and languages.
 - Settings menu polish, rumble, installer polish — then Windows as its own project.
 
 ---

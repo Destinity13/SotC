@@ -22,6 +22,19 @@ namespace ps2_syscalls
         case 0x04:
             ExitThread(rdram, ctx, runtime);
             return true;
+        case 0x0D: // SetVTLBRefillHandler(cause, handler)
+        case 0x0E: // SetVCommonHandler(cause, handler)
+        {
+            // The recompiled game never takes TLB or other CPU exceptions, so these vectors are never entered.
+            // Like the BIOS, remember the handler per cause and return the previous one (libkernel's init
+            // installs its defaults here at boot).
+            static uint32_t s_vecHandlers[2][16] = {};
+            uint32_t &slot = s_vecHandlers[syscallNumber - 0x0D][getRegU32(ctx, 4) & 15u];
+            const uint32_t previous = slot;
+            slot = getRegU32(ctx, 5);
+            setReturnS32(ctx, static_cast<int32_t>(previous));
+            return true;
+        }
         case 0x10:
             AddIntcHandler(rdram, ctx, runtime);
             return true;
