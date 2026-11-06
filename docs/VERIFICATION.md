@@ -45,7 +45,9 @@ compares the full VU state (VF, VI, ACC, Q, P, flags, clip) afterwards.
 ## 6. Determinism
 
 Three runs of the same replay with MTVU and the GS thread enabled, under full machine load (28
-parallel jobs), produced bit-identical frames.
+parallel jobs), produced bit-identical frames. One later exception is tracked in
+[KNOWN_ISSUES](KNOWN_ISSUES.md): a single run out of six diverged after ~1,400 frames under load; its repeats were
+identical.
 
 ## 7. Unit tests
 

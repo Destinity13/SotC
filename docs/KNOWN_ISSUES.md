@@ -6,8 +6,8 @@ An honest list, as of November 2026 (runtime build `pc164`).
 
 ## Open
 
-- **VU1 headroom in heavy colossus moments.** All VU1 programs are compiled ahead of time, but the VU1 thread
-  still needs a large share of the 16.7 ms frame at 60 Hz. Short dips are still possible.
+- **Later colossi are not benchmarked yet.** The first colossus fight replays at 76–98 FPS unpaced
+  ([PERFORMANCE](PERFORMANCE.md#colossus-benchmark-pc164)); later fights may load VU1 more.
 - **Texture packs cost a little more GPU work in the open world** than no pack (≈ 2–4× the render-pass barriers of
   the baseline, after the fixes in [PERFORMANCE.md](PERFORMANCE.md#texture-packs-making-them-fast)). Not visible
   as a frame-rate drop on the development machine.

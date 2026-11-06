@@ -23,6 +23,22 @@ over 7.26 million VU1 program invocations** and 36/36 regression screenshots are
 
 Measured with the thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`), solo, same replay, no PGO noise.
 
+## Colossus benchmark (`pc164`)
+
+The full recording of the first colossus fight (28,256 frames: ride, climb, fight) replayed unpaced at 4× internal
+resolution with the HD texture pack, user settings (16× AF, FXAA, CAS), nothing else running:
+
+| | |
+|---|---|
+| Average | **93.6 FPS** (302 s for 28,256 frames) |
+| Per 2,000-frame section | 89.8 – 97.8 FPS |
+| Slowest 50-frame window | 75.7 FPS (one 37.9 FPS window during the initial load) |
+| Windows below 60 FPS | 1 of 561 (the load) |
+| VU1 thread | busy 150 s of 302 s; the game thread waited 0.4 s in total for it |
+
+The game runs at a fixed 60 FPS (50 in PAL mode), so this is headroom, not the displayed frame rate. A real
+5.6-minute play session on the same build ran at a constant 60 Hz with no dips after boot.
+
 ## Texture packs: making them fast
 
 Upscaled PCSX2 texture packs often slow PCSX2 down far more than their size suggests. Two causes were found and
