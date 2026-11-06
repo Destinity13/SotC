@@ -2206,7 +2206,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (gen != m_recGen)
         {
             m_recGen = gen;
-            const uint64_t recHash = ps2x_vu1dump::fnv(vuCode, codeSize);
+            // Schluessel fuers Nachschlagen: zwei CRC32C-Ketten ueber 8-Byte-Woerter (Hardware, ~10x schneller als FNV je
+            // Byte; lief bei jedem Code-Upload und kostete ~6 % der VU1-Zeit). Zuordnung selbst ueber Signaturen (gecacht).
+            uint64_t recHash;
+            {
+                uint64_t c0 = 0x9E3779B9u, c1 = 0x85EBCA6Bu;
+                const uint8_t *q = vuCode; uint32_t k = 0;
+                for (; k + 16u <= codeSize; k += 16u, q += 16)
+                {
+                    uint64_t w0, w1; std::memcpy(&w0, q, 8); std::memcpy(&w1, q + 8, 8);
+                    c0 = _mm_crc32_u64(c0, w0); c1 = _mm_crc32_u64(c1, w1);
+                }
+                recHash = ((c0 << 32) | (c1 & 0xFFFFFFFFu)) ^ (0xC2B2AE3D27D4EB4Full * codeSize) ^ 0x5A5A000000000000ull;
+            }
             // Erkennung ueber die Bytes der uebersetzten Paare (Signatur), nicht ueber den ganzen Mikrospeicher:
             // derselbe Modulcode mit anderen Resten im Speicher bleibt erkannt
             m_recFn = vu1CompiledMatch(vuCode, codeSize, recHash, &m_recEntry);
@@ -2217,7 +2229,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 static std::mutex s_m; static std::set<uint64_t> s_seen;
                 std::lock_guard<std::mutex> lk(s_m);
                 if (s_seen.insert(recHash).second)
-                    std::fprintf(stderr, "[VU1-Rec] unbekanntes Programm %016llx (Interpreter)\n", (unsigned long long)recHash);
+                    std::fprintf(stderr, "[VU1-Rec] unbekanntes Programm %016llx (Interpreter)\n", (unsigned long long)ps2x_vu1dump::fnv(vuCode, codeSize));
             }
         }
         if (m_recFn && m_recFn(*this, vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd, programEnded) == 0)
@@ -2231,7 +2243,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // Nach einem Rueckfall (Abdeckungsluecke) am naechsten Einstieg zurueck in den uebersetzten Code, statt das
         // restliche Programm im Interpreter zu rechnen. Gleiche Bedingungen wie der Einstieg im uebersetzten Code.
         if (m_recEntry && !m_compiledDisabled && m_state.pc != m_recSkipPc && m_recEntry[(m_state.pc & 0x3FFFu) >> 3] &&
-            !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot && !hasPendingRegWrites())
+            !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot && !hasPendingRegWrites() && !hasPendingOther() && allWritesRetired())
         {
             const uint32_t pcBefore = m_state.pc;
             if (m_recFn(*this, vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd, programEnded) == 0)

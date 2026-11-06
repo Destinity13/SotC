@@ -25,7 +25,7 @@ for f in "$ROOT"/extracted/*; do
     ln -sfn "$f" "$RUN/$name"
 done
 cp -f "$ROOT/elf/sotc_linked.elf" "$RUN/SCES_533.26"
-BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc158}"   # aktuelle Binary (pc158: Spielprofil je Minute; pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
+BIN="${SOTC_BIN:-$ROOT/build/sotc/ps2EntryRunner_pc162}"   # aktuelle Binary (pc162: statische VU1-Taktplanung Stufe 1+2, VU1 -25 %; pc159: CRC-Schluessel statt FNV je Upload; pc158: Spielprofil je Minute; pc157: Signaturen ohne Speicherreste -> Koloss-Modul wird immer erkannt; pc154: alle 21 VU1-Programme aus MANAGER.XFF statisch uebersetzt, Signatur-Erkennung, Fortsetzungen; pc150: +176 VU1-Paare aus der Koloss-Aufnahme; pc149: Wiedereinstieg in den VU1-Uebersetzer nach Abdeckungsluecken, Mitschnitt laeuft mit Uebersetzer; pc148: Sticky-Flags entfallen [VU1 -15 %], Takt im Register, 60-Hz-Fix SetGsCrt, VU1-Mitschnitt beim Spielen, frisches PGO; pc143: + Clip-Ring, VIF-UNPACK spezialisiert, frisches PGO; pc138: VU1 -13 % [Lower-Befehle direkt, Buchhaltung, XGKICK am Stueck], frisches PGO; pc126: strcmp newlib-exakt; pc125: MOVZ/MOVN 64 Bit; pc124: VDIV/VMAX/VMINI/SQRT.S/PMULTW/rand/newlib-sinf-cosf/PAL-Hblank wie PS2; pc118: HLE-Pools/Rueckruf-Stapel aus Spielspeicher in Kernel-RAM, Spiel beenden geht; pc113: Interrupt-Stapel nicht mehr auf Hauptstapel; pc108: SQRT.S liest ft wie PCSX2 = Laufen/Stick-Staerke repariert; pc107: Tickmap; pc105: PS2-genaue FPU-Vergleiche, chop_daz, Kamera-Unschaerfe-Absturz behoben, EE-Rundung daz, DIV wie PCSX2, Eingabe-Aufnahme, VU0 ohne Abschneiden, Systemsprache, Bildrate folgt Spiel, Musik-Stream-Fix, VU1-Rekompilierer Stufe 5, MTVU, PGO, PCSX2-GS, Eingabe im Spielfenster)
 if [ ! -x "$BIN" ] && [ -f "$BIN.xz" ]; then
     echo "==> Entpacke vorgebaute Binary"
     xz -dkf "$BIN.xz" && chmod +x "$BIN"
@@ -60,12 +60,14 @@ if [ -z "${PS2X_VU1_DUMP+x}" ] && [ "${SOTC_VU1_MITSCHNITT:-1}" = 1 ]; then  # a
     export PS2X_VU1_DUMP_EVERY="${PS2X_VU1_DUMP_EVERY:-262144}"
 fi
 [ -n "$PS2X_VU1_DUMP" ] && mkdir -p "$PS2X_VU1_DUMP"
-# HD-Text (Neusatz mit TeX Gyre, kein KI-Upscaling): Ersatztexturen in den Texturordner der GS-Bruecke legen.
-# Greifen nur ueber ihren Hash (deutsche Seiten); neuere Fassungen ersetzen aeltere. Abschalten: SOTC_HD_TEXT=0
-if [ "${SOTC_HD_TEXT:-1}" = 1 ] && [ -z "${PS2XGS_TEXDIR:-}" ]; then
-    _hd_src="$ROOT/build/texturen/neusatz_ersatz_de/SCES-53326/replacements"
-    _hd_dst="${XDG_CONFIG_HOME:-$HOME/.config}/sotc-recomp/texturen/SCES-53326/replacements"
-    if [ -d "$_hd_src" ]; then mkdir -p "$_hd_dst" && cp -u "$_hd_src"/*.png "$_hd_dst"/ 2>/dev/null || true; fi
+# Texturen: Quellen in build/texturquellen/<Name>/ (Spielmenue -> Texturen schaltet sie an/aus, HD-Text hat Vorrang).
+#   hd-text          = unser Neusatz der Menue-/Untertitelseiten (TeX Gyre, kein KI-Upscaling)
+#   origami-remaster = Texturpaket von Sad Origami (PAL), importiert aus texturpakete/
+# Abschalten aller Ersatztexturen: im Menue, oder SOTC_HD_TEXT=0 / PS2XGS_TEXDIR setzen.
+export PS2XGS_TEXQUELLEN="${PS2XGS_TEXQUELLEN:-$ROOT/build/texturquellen}"
+mkdir -p "$PS2XGS_TEXQUELLEN"
+if [ "${SOTC_HD_TEXT:-1}" = 1 ] && [ ! -e "$PS2XGS_TEXQUELLEN/hd-text" ]; then
+    ln -s "$ROOT/build/texturen/neusatz_ersatz_de/SCES-53326/replacements" "$PS2XGS_TEXQUELLEN/hd-text"
 fi
 # Laufzeitprofil beim Spielen (Stichprobe alle 2 ms CPU-Zeit, kaum messbare Last): jede Minute ein Zwischenstand in
 # build/spiel_profil/<start>/ -> tools/profil_minute.py zeigt, wo in einer bestimmten Spielminute die Zeit hingeht.

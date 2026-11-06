@@ -241,6 +241,33 @@ private:
     // Uebertraegt eine laufende XGKICK sofort komplett: GIFtags einzeln ueber progressXgkick (Pruefungen wie bisher),
     // die Nutzdaten eines Tags am Stueck. Gleiches Paket, gleiche Laenge wie Quadword fuer Quadword.
     void progressXgkickBulk();
+    // Statische Taktplanung (tools/vu1rec.py): uebersetzter Code prueft keine Faelligkeiten je Paar mehr. Deshalb darf
+    // beim Einstieg nichts in den Interpreter-Warteschlangen stehen, das er sonst dort eingetragen haette.
+    bool hasPendingOther() const
+    {
+        for (const auto &e : m_flagPipeline) if (e.valid) return true;
+        for (const auto &s : m_storePipeline) if (s.valid) return true;
+        for (const auto &a : m_accWritePipeline) if (a.valid) return true;
+        for (const auto &e : m_efu) if (e.valid) return true;
+        return m_xgkick.active;
+    }
+    // Wiedereinstieg aus dem Interpreter: der uebersetzte Code prueft Bereitschaft nur fuer die Register, die an diesem
+    // Einstieg aus uebersetztem Code noch unterwegs sein koennen - aus dem Interpreter darf deshalb nichts unterwegs sein
+    bool allWritesRetired() const
+    {
+        for (const auto &r : m_vfReady) for (uint64_t c : r) if (c > m_cycle) return false;
+        for (uint64_t c : m_viReady) if (c > m_cycle) return false;
+        for (uint64_t c : m_accReady) if (c > m_cycle) return false;
+        return true;
+    }
+    // Q-Ergebnis sichtbar machen (wie commitReadyPipelines fuer m_fdiv); der uebersetzte Code ruft es vor Q-Lesern/DIV
+    void publishQ()
+    {
+        m_state.q = m_fdiv.value;
+        const uint32_t di = m_fdiv.statusDi & 0x30u;
+        m_state.status = (m_state.status & 0xFCFu) | di | (di << 6);
+        m_fdiv = {};
+    }
     bool hasPendingRegWrites() const
     {
         for (const auto &w : m_vfWritePipeline) if (w.valid) return true;

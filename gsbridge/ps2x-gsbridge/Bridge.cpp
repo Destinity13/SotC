@@ -1204,6 +1204,10 @@ static std::atomic<bool> s_shutdown_requested{false};
 #include "imgui.h"
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "pcsx2/MTGS.h"
+#include "pcsx2/GS/Renderers/HW/GSTextureReplacements.h"
+#include "pcsx2/GS/Renderers/Common/GSRenderer.h"
+#include <filesystem>
+#include <vector>
 #include <fstream>
 #include <sys/stat.h>
 namespace ps2xosd { std::atomic<u32> btns{0}, axes{0x80808080u}, keyBtns{0}; } // zuletzt ans Spiel gelieferte Eingabe
@@ -1225,6 +1229,8 @@ namespace ps2xmenu
 		int upscale = 4, aspect = 0, cas = 1, casSharp = 25, tv = 0, filter = 2, aniso = 16, dither = 0;
 		int sbB = 50, sbC = 50, sbS = 50, rumblePct = 100, hz = 50, volume = 100, camBlur = 1;
 		bool fxaa = false, shadeboost = false, fullscreen = false, showFps = false, rumble = true, vsync = false, startMenu = true;
+		bool hdText = true;      // Neusatz der Textseiten (TeX Gyre), hat Vorrang vor Paketen
+		std::string packs = "*"; // aktive Texturpakete ("*" = alle vorhandenen, Voreinstellung) (Ordnernamen in texturquellen/, durch Komma, Reihenfolge = Prioritaet)
 	};
 	std::mutex m;
 	Cfg cfg;
@@ -1281,6 +1287,8 @@ namespace ps2xmenu
 			else if (k == "bildrate") cfg.hz = (v == 60 && std::getenv("SOTC_60HZ_EXPERIMENT")) ? 60 : 50; // 60 Hz: Figur-Physik noch fehlerhaft
 			else if (k == "lautstaerke") cfg.volume = std::clamp(v, 0, 200);
 			else if (k == "kamera_unschaerfe") cfg.camBlur = v != 0 ? 1 : 0;
+			else if (k == "hd_text") cfg.hdText = v != 0;
+			else if (k == "texturpakete") cfg.packs = line.substr(eq + 1);
 		}
 	}
 	void save()
@@ -1293,7 +1301,99 @@ namespace ps2xmenu
 		  << "\ncas_staerke=" << c.casSharp << "\ndithering=" << c.dither << "\ntv_shader=" << c.tv << "\nfarbe=" << c.shadeboost << "\nhelligkeit=" << c.sbB
 		  << "\nkontrast=" << c.sbC << "\nsaettigung=" << c.sbS << "\ntexturfilter=" << c.filter << "\nanisotrop=" << c.aniso
 		  << "\nvollbild=" << c.fullscreen << "\nfps_anzeige=" << c.showFps << "\nvibration=" << c.rumble
-		  << "\nvibration_staerke=" << c.rumblePct << "\nvsync=" << c.vsync << "\nbildrate=" << c.hz << "\nlautstaerke=" << c.volume << "\nkamera_unschaerfe=" << c.camBlur << "\nstartmenue=" << c.startMenu << "\n";
+		  << "\nvibration_staerke=" << c.rumblePct << "\nvsync=" << c.vsync << "\nbildrate=" << c.hz << "\nlautstaerke=" << c.volume << "\nkamera_unschaerfe=" << c.camBlur << "\nstartmenue=" << c.startMenu << "\nhd_text=" << c.hdText << "\ntexturpakete=" << c.packs << "\n";
+	}
+	// ---------- Texturquellen (HD-Text + Pakete) -> zusammengesetzter Ersatzordner ----------
+	// Quellen: <dir>/texturquellen/<name>/... (hd-text = unser Neusatz; Pakete werden von "SotC starten" aus
+	// texturpakete/*.zip|7z|rar importiert). Ziel: <Textures>/SCES-53326/replacements als Verweise (Symlinks); spaetere
+	// Quelle ueberschreibt fruehere, HD-Text zuletzt. PS2XGS_TEXDIR (Testlaeufe) schaltet die Verwaltung ab.
+	// PS2XGS_TEXQUELLEN: Ordner mit den Texturquellen (Startskript: <Projekt>/build/texturquellen), sonst ~/.config/...
+	std::string quellenDir()
+	{
+		if (const char* q = std::getenv("PS2XGS_TEXQUELLEN"); q && *q) return q;
+		return dir() + "/texturquellen";
+	}
+	std::string texRoot()
+	{
+		if (const char* t = std::getenv("PS2XGS_TEXDIR"); t && *t) return t;
+		return dir() + "/texturen";
+	}
+	bool texManaged() { const char* t = std::getenv("PS2XGS_TEXDIR"); return !(t && *t); }
+	std::vector<std::string> listSources()
+	{
+		std::vector<std::string> out;
+		std::error_code ec;
+		for (const auto& e : std::filesystem::directory_iterator(quellenDir(), ec))
+			if (e.is_directory(ec) && e.path().filename() != "hd-text" && e.path().filename().string()[0] != '.')
+				out.push_back(e.path().filename().string());
+		std::sort(out.begin(), out.end());
+		return out;
+	}
+	std::vector<std::string> listSources();
+	std::vector<std::string> activePacks(const std::string& p)
+	{
+		if (p == "*") return listSources();
+		std::vector<std::string> out; std::string cur;
+		for (char ch : p + ",") { if (ch == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); } else cur += ch; }
+		return out;
+	}
+	void setPackActive(std::string& packs, const std::string& name, bool on)
+	{
+		auto v = activePacks(packs);
+		v.erase(std::remove(v.begin(), v.end(), name), v.end());
+		if (on) v.push_back(name);
+		std::string j; for (const auto& x : v) { if (!j.empty()) j += ','; j += x; }
+		packs = j;
+	}
+	bool sameCfg(const Cfg& a, const Cfg& b)
+	{
+		return a.upscale == b.upscale && a.aspect == b.aspect && a.cas == b.cas && a.casSharp == b.casSharp && a.tv == b.tv && a.filter == b.filter &&
+		       a.aniso == b.aniso && a.dither == b.dither && a.sbB == b.sbB && a.sbC == b.sbC && a.sbS == b.sbS && a.rumblePct == b.rumblePct &&
+		       a.hz == b.hz && a.volume == b.volume && a.camBlur == b.camBlur && a.fxaa == b.fxaa && a.shadeboost == b.shadeboost &&
+		       a.fullscreen == b.fullscreen && a.showFps == b.showFps && a.rumble == b.rumble && a.vsync == b.vsync && a.startMenu == b.startMenu &&
+		       a.hdText == b.hdText && a.packs == b.packs;
+	}
+	static void linkTree(const std::filesystem::path& src, const std::filesystem::path& dst, unsigned& n)
+	{
+		std::error_code ec;
+		for (const auto& e : std::filesystem::recursive_directory_iterator(src, std::filesystem::directory_options::follow_directory_symlink, ec))
+		{
+			if (!e.is_regular_file(ec)) continue;
+			std::string ext = e.path().extension().string();
+			std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+			if (ext != ".png" && ext != ".dds") continue;
+			const auto to = dst / e.path().filename();
+			std::filesystem::remove(to, ec);
+			std::filesystem::create_symlink(std::filesystem::absolute(e.path()), to, ec);
+			if (!ec) ++n;
+		}
+	}
+	// Zusammensetzen; Rueckgabe = Anzahl Dateien. Darf vor dem GS-Start und auf dem GS-Thread laufen.
+	unsigned assembleTextures()
+	{
+		if (!texManaged()) return 0;
+		std::error_code ec;
+		const std::filesystem::path root = texRoot();
+		const auto dst = root / "SCES-53326" / "replacements";
+		const auto marker = dst / ".verwaltet";
+		std::filesystem::create_directories(dst, ec);
+		if (!std::filesystem::exists(marker, ec))
+		{
+			// Altbestand (von Hand oder von frueheren Startskripten kopiert) einmalig als Quelle "alt" sichern
+			const auto alt = std::filesystem::path(quellenDir()) / "alt" / "replacements";
+			bool any = false;
+			for (const auto& e : std::filesystem::directory_iterator(dst, ec))
+				if (e.is_regular_file(ec) && !e.is_symlink(ec)) { if (!any) { std::filesystem::create_directories(alt, ec); any = true; } std::filesystem::rename(e.path(), alt / e.path().filename(), ec); }
+			std::ofstream(marker.string()) << "Dieser Ordner wird vom Spielmenue (Texturen) verwaltet - Inhalt sind Verweise auf texturquellen/.\n";
+		}
+		for (const auto& e : std::filesystem::directory_iterator(dst, ec))
+			if (e.is_symlink(ec)) std::filesystem::remove(e.path(), ec);
+		unsigned n = 0;
+		const auto q = std::filesystem::path(quellenDir());
+		std::string pk; bool hd; { std::lock_guard<std::mutex> lk(m); pk = cfg.packs; hd = cfg.hdText; }
+		for (const auto& name : activePacks(pk)) linkTree(q / name, dst, n);
+		if (hd) linkTree(q / "hd-text", dst, n);
+		return n;
 	}
 	// in die PCSX2-Einstellungen uebertragen (CPU-Thread bzw. vor dem Start)
 	void toSettings(SettingsInterface& si)
@@ -1541,6 +1641,34 @@ namespace ps2xmenu
 				ImGui::TextDisabled("Shift/R L2/R2, F/G L3/R3, Enter Start, Tab Select");
 				ImGui::EndTabItem();
 			}
+			if (ImGui::BeginTabItem("Texturen"))
+			{
+				static std::vector<std::string> quellen; static double lastScan = -1e9;
+				if (ImGui::GetTime() - lastScan > 2.0) { quellen = listSources(); lastScan = ImGui::GetTime(); }
+				static unsigned linked = 0; static bool dirty = false;
+				if (ImGui::Checkbox("HD-Text (Neusatz der Menue- und Untertiteltexte)", &c.hdText)) dirty = true;
+				ImGui::Separator();
+				ImGui::Text("Texturpakete (PCSX2-Format, z. B. Origami Remaster PAL, Panda_Venom EU):");
+				const auto act = activePacks(c.packs);
+				if (quellen.empty()) ImGui::TextDisabled("keine Pakete gefunden");
+				for (const auto& q : quellen)
+				{
+					bool on = std::find(act.begin(), act.end(), q) != act.end();
+					if (ImGui::Checkbox(q.c_str(), &on)) { setPackActive(c.packs, q, on); dirty = true; }
+				}
+				ImGui::TextDisabled("Neue Pakete: Archiv in den Ordner 'texturpakete' des Projekts legen, 'SotC starten' importiert es.");
+				ImGui::TextDisabled("Oder entpackt nach %s/<Name>/", quellenDir().c_str());
+				if (ImGui::Button(dirty ? "Uebernehmen und Texturen neu laden" : "Texturen neu laden"))
+				{
+					{ std::lock_guard<std::mutex> lk(m); cfg = c; }
+					linked = assembleTextures();
+					if (g_gs_renderer) { GSTextureReplacements::ReloadReplacementMap(); g_gs_renderer->PurgeTextureCache(true, false, true); }
+					dirty = false;
+				}
+				if (linked) { ImGui::SameLine(); ImGui::TextDisabled("%u Dateien aktiv", linked); }
+				ImGui::TextDisabled("Grosse Pakete werden beim Laden vorab in den Grafikspeicher geladen (kurze Pause).");
+				ImGui::EndTabItem();
+			}
 			if (ImGui::BeginTabItem("Speicherstand"))
 			{
 				ImGui::TextWrapped("%s", memcardInfo().c_str());
@@ -1560,7 +1688,7 @@ namespace ps2xmenu
 			ImGui::SetKeyboardFocusHere(-1);
 		ImGui::End();
 
-		const bool changed = std::memcmp(&before, &c, sizeof(Cfg)) != 0;
+		const bool changed = !sameCfg(before, c);
 		if (changed)
 		{
 			{ std::lock_guard<std::mutex> lk(m); cfg = c; }
@@ -2094,6 +2222,7 @@ PS2XGS_API int ps2xgs_start(const char* live_path, int renderer, float upscale, 
 		else tex = ps2xmenu::dir() + "/texturen";
 		s_settings_interface.SetStringValue("Folders", "Textures", tex.c_str());
 		EmuFolders::Textures = tex; // wurde schon beim Start aus der PCSX2-Konfiguration gesetzt
+		{ const unsigned n = ps2xmenu::assembleTextures(); if (n) Console.WriteLn("[ps2x] Texturen: %u Ersatzdateien aktiv (HD-Text/Pakete)", n); }
 		s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacements", true);
 		s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacementsAsync", false); // kein Aufploppen
 		s_settings_interface.SetBoolValue("EmuCore/GS", "PrecacheTextureReplacements", true);

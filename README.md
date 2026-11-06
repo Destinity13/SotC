@@ -47,6 +47,7 @@ pipeline in this repo turns *your* dump into *your* build on *your* machine (see
 | First colossus | ✅ | **fought and defeated natively** (`pc157`, 60 Hz mode), in-game save works |
 | Full-speed in colossus fights | 🚧 | mostly 60 FPS; heavy moments dip to ~46–55 FPS (VU1 load, not coverage) |
 | HD text | 🚧 | German pages of the intro/menus done, rest pending |
+| Texture packs | ✅ | PCSX2-format packs (e.g. Sad Origami's PAL remaster) load directly; in-game *Textures* tab switches packs and HD text live |
 | Settings menu, rumble, installer | ⬜ | planned |
 | Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
 
@@ -117,6 +118,7 @@ over 7.26 million VU1 program invocations** and 36/36 regression screenshots are
 | Sticky status bits (`0xFC0`) dropped: a whole-program scan proves no VU1 program of this game ever reads them (all `FSAND` masks are `0x002`, `FMAND`/`FMEQ` read MAC, no `FCSET`) — without PGO | 59.0 s | **−29 %** |
 | Interpreter → compiled re-entry at the next block entry after a coverage gap (`pc149`) | – | colossus fix |
 | **All VU1 code compiled statically** (`pc154`): modules read from the game files, entries from each module's jump table and `MSCNT` continuations, reachability like PCSX2's microVU; programs recognised by a signature of exactly the bytes they compile, so leftovers of previously loaded modules no longer cause misses. 7,666 → **33,837** compiled instruction pairs, 11 → **21** programs | – | ✓ |
+| **Static cycle planning** (`pc161`/`pc162`, microVU-style): the cycle counter is accumulated per straight-line run and only materialised where something reads it; readiness marks only for writes that can outlive a run; Q made visible explicitly before its readers; entry checks only for registers that can still be in flight from a predecessor (pipeline state propagated across static branches) | **43.0 s** | **−48 %** vs. the 83 s baseline |
 | Tried and rejected: a leaner FMAC core with normalised register shadows ("stage 6") — correct, but 8–15 % *slower* (code size / spills) | 89.8–95.6 s | ✗ |
 
 Measured with the thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`), solo, same replay, no PGO noise.
@@ -178,7 +180,7 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Verification method: [doc
 | Test runs | 1,231 automated runs through the job queue (replays, differential VU1 tests, RAM comparisons, PCSX2 reference runs), up to 28 in parallel |
 | Reference comparisons | PCSX2 2.8.2 driven by a virtual game pad over PINE, savestates compared word by word |
 | Development machine | AMD Ryzen 9 7950X · AMD Radeon RX 7900 XT · CachyOS (Linux, KDE Plasma / Wayland) |
-| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution. Unpaced benchmark (5,500-frame open-world replay): **73.8 FPS** (`pc148`), VU1 thread **59.3 s CPU** — down from 83 s through bit-exact compiler/runtime steps (see below) |
+| Performance | 1 frame per VBlank (50/60 FPS) in the open world at 3× internal resolution. Unpaced benchmark (5,500-frame open-world replay): **85 FPS** (`pc162`), VU1 thread **43 s CPU** — down from 83 s through bit-exact compiler/runtime steps (see below) |
 
 ---
 

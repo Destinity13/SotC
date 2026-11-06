@@ -8,6 +8,7 @@ wird das mit PS2X_VU1_DIFF=1.
 
 Aufruf:  vu1rec.py <dump-ordner> <ausgabe.cpp> [min_anteil_prozent] [stufe 1|2]
 """
+import re
 import os, struct, sys, collections
 
 PIPE_FDIV, PIPE_EFU, PIPE_BRANCH, PIPE_XGKICK = 3, 4, 6, 7
@@ -725,6 +726,81 @@ def rec_lat(d):
 
 RECPEND_DEAD = set()  # Stufe 5: Paare, deren m_recPend-Aktualisierung von einem spaeteren Paar im Block sicher ueberboten wird
 
+def analyse_dist(pairs, entries, exits):
+    """Abstand (in Paaren) jedes Paars zum naechsten moeglichen Ausgang seines geradlinigen Abschnitts: Verzoegerungs-
+    paar eines Sprungs, reserviertes Paar, Luecke, oder das letzte Paar vor einem Einstieg (dort prueft der Nachfolger
+    zur Laufzeit). Ein Schreibzugriff mit Latenz L ist an der Grenze sicher fertig, wenn Abstand >= L-1."""
+    DIST_EXIT.clear()
+    run = []; lastpc = None
+    def done():
+        n = len(run); nx = None
+        for idx in range(n - 1, -1, -1):
+            if idx == n - 1 or run[idx] in exits:
+                nx = idx
+            DIST_EXIT[run[idx]] = nx - idx
+        run.clear()
+    for p in pairs:
+        if p.pc in entries or lastpc is None or p.pc != ((lastpc + 8) & 0x3FFF):
+            done()
+        run.append(p.pc); lastpc = p.pc
+    done()
+
+def analyse_inflight(pairs, entries, exits, prev):
+    """Stufe 2 (wie microVU-Pipeline-Zustand): welche Register koennen an einem Einstieg noch unterwegs sein?
+    Aus jedem Ausgang (Verzoegerungspaar k) kommen die Schreibzugriffe der letzten Paare mit (k-j+1) < Latenz.
+    Statische Spruenge -> ihr Ziel; Weiterlaufen -> der folgende Einstieg; JR/JALR -> alle Einstiege (Ziel unbekannt).
+    Programmstart und Wiedereinstieg aus dem Interpreter bringen nichts mit (Scheduler geleert bzw. Laufzeitpruefung)."""
+    INFLIGHT.clear()
+    for e in entries:
+        INFLIGHT[e] = set()
+    bypc = {p.pc: p for p in pairs}
+    # Schreibzugriffe je Paar: (schluessel, latenz)
+    writes = {p.pc: pair_rw(p)[1] for p in pairs}
+    def tail_inflight(k):
+        out = set(); pc = k; n = 0
+        while pc in bypc and n < 16:
+            for key, L in writes[pc]:
+                if n + 1 < L:
+                    out.add(key)
+            n += 1
+            prv = (pc - 8) & 0x3FFF
+            if pc in entries or prv not in bypc:
+                break
+            pc = prv
+        return out
+    dyn = set()
+    lastpc = None
+    order = sorted(bypc)
+    for idx, pc in enumerate(order):
+        p = bypc[pc]
+        c = lower_ctrl(p)
+        slot = (pc + 8) & 0x3FFF
+        nxt_after_slot = (pc + 16) & 0x3FFF
+        if c and slot in bypc:
+            fl = tail_inflight(slot)
+            if c[0] == "static":
+                if c[2] in INFLIGHT: INFLIGHT[c[2]] |= fl
+                if c[1] != "B" and nxt_after_slot in INFLIGHT: INFLIGHT[nxt_after_slot] |= fl  # bedingt nicht genommen / BAL-Ruecksprung
+            else:
+                dyn |= fl
+                if c[1] == "JALR" and nxt_after_slot in INFLIGHT: INFLIGHT[nxt_after_slot] |= fl
+        # Weiterlaufen in einen Einstieg: immer, ausser pc ist Verzoegerungspaar eines unbedingten Sprungs (B/BAL/JR/JALR)
+        # oder eines Programmendes (danach startet das Programm neu: nichts unterwegs)
+        nxt = (pc + 8) & 0x3FFF
+        if nxt in INFLIGHT:
+            k = prev.get(pc)
+            flows = True
+            if k is not None:
+                if k[0] == "static":
+                    c0 = lower_ctrl(bypc[(pc - 8) & 0x3FFF]) if ((pc - 8) & 0x3FFF) in bypc else None
+                    flows = bool(c0) and c0[1] not in ("B", "BAL")
+                else:
+                    flows = False
+            if flows:
+                INFLIGHT[nxt] |= tail_inflight(pc)
+    for e in INFLIGHT:
+        INFLIGHT[e] |= dyn
+
 def analyse_recpend(pairs, entries, exits):
     """Zwischen Paar i und einem spaeteren Paar j desselben geradlinigen Abschnitts vergehen mindestens j-i Takte.
     Gilt lat_j + (j-i) >= lat_i, liegt cycle_j + lat_j sicher nicht unter cycle_i + lat_i: die Speicherung bei i ist
@@ -751,26 +827,34 @@ def analyse_recpend(pairs, entries, exits):
     done()
 
 def gen_mark(d, w, W, hasUpperWrite, hasLowerWrite, UW, UWL, LW, LWL):
+    statik = STATIK and STUFE >= 5 and FLAG_TARGET == "ring"
+    dist = DIST_EXIT.get(d.pc, 0)
+    def mark_needed(key, lat):
+        if not statik:
+            return True
+        return dist < lat - 1 or (d.pc, key) in MARK_USED
     if STUFE >= 2:
         # Interpreter haette diese Schreibvorgaenge bis zu ihrem Fertig-Zyklus in der Warteschlange (Programmende wartet darauf)
         L = rec_lat(d)
-        if L and not (STUFE >= 5 and FLAG_TARGET == "ring" and d.pc in RECPEND_DEAD):
+        if L and not (STUFE >= 5 and FLAG_TARGET == "ring" and d.pc in RECPEND_DEAD) and (not statik or dist < L - 1):
             w("            if (v.m_cycle + %du > v.m_recPend) v.m_recPend = v.m_cycle + %du;" % (L, L))
     if hasLowerWrite:
         lat = d.lu.vfLat or d.lu.lat
         for c in range(4):
-            if LWL & LANE[c]:
+            if LWL & LANE[c] and mark_needed("v.m_vfReady[%d][%d]" % (LW, c), lat):
                 w("            v.m_vfReady[%d][%d] = v.m_cycle + %d;" % (LW, c, lat))
     if hasUpperWrite:
         lat = d.uu.vfLat or d.uu.lat
         for c in range(4):
-            if UWL & LANE[c]:
+            if UWL & LANE[c] and mark_needed("v.m_vfReady[%d][%d]" % (UW, c), lat):
                 w("            v.m_vfReady[%d][%d] = v.m_cycle + %d;" % (UW, c, lat))
     for reg in range(1, 16):
         if d.lu.viWrite & (1 << reg):
-            w("            v.m_viReady[%d] = v.m_cycle + %d;" % (reg, d.lu.viLat or d.lu.lat))
+            lat = d.lu.viLat or d.lu.lat
+            if mark_needed("v.m_viReady[%d]" % reg, lat):
+                w("            v.m_viReady[%d] = v.m_cycle + %d;" % (reg, lat))
     for c in range(4):
-        if d.uu.accWrite & LANE[c]:
+        if d.uu.accWrite & LANE[c] and mark_needed("v.m_accReady[%d]" % c, 1):
             w("            v.m_accReady[%d] = v.m_cycle + 1;" % c)
     if W and d.lu.delayBr:
         if FLAG_TARGET == "ring":
@@ -1249,24 +1333,28 @@ def analyse_blocks(pairs, entries, exits):
     Jeder Takt eines Paars ist >= 1, also ist ein im Block geschriebenes Register nach Latenz-vielen Paaren sicher
     fertig; ein schon geprueftes bleibt fertig. Nur die erste Pruefung je Register und Block bleibt zur Laufzeit.
     Speicherungen, die vor dem naechsten Lesen ueberschrieben werden, entfallen; an jedem Ausgang ist alles gespeichert."""
-    BLOCK_NEED.clear(); BLOCK_DEAD.clear()
+    BLOCK_NEED.clear(); BLOCK_DEAD.clear(); MARK_USED.clear()
     state = {}; pend = {}; j = 0; lastpc = None
+    infl = None
     def flush():
         pend.clear()
     for p in pairs:
         if p.pc in entries or lastpc is None or p.pc != ((lastpc + 8) & 0x3FFF):
             flush(); state.clear(); j = 0
+            infl = INFLIGHT.get(p.pc) if (STATIK and STATIK2 and STUFE >= 5) else None
         reads, writes = pair_rw(p)
         need = set()
         for k in reads:
             st = state.get(k)
             if st is None:
-                need.add(k)
+                if infl is None or k in infl:
+                    need.add(k)
             elif st != "ok":
                 kw, L, pcw = st
                 if j - kw < L:
                     need.add(k)
                     pend.pop(k, None)  # Speicherung wird gelesen -> bleibt
+                    MARK_USED.add((pcw, k))
             state[k] = "ok"
         BLOCK_NEED[p.pc] = need
         BLOCK_DEAD.setdefault(p.pc, set())
@@ -1282,6 +1370,15 @@ def analyse_blocks(pairs, entries, exits):
 
 DEAD_FLAGS = set()
 CUR_PC = -1
+# Statische Taktplanung (wie microVU): Takt-Zaehler wird je geradlinigem Abschnitt gesammelt (PEND) und nur dort
+# nachgefuehrt, wo er gebraucht wird; Bereitschafts-Marken nur fuer Schreibzugriffe, die eine Abschnittsgrenze
+# ueberleben koennen oder im Abschnitt noch geprueft werden; Q wird an Lesern/DIV explizit sichtbar gemacht.
+STATIK = os.environ.get("VU1REC_STATIK", "1") == "1"
+PEND = [0]
+DIST_EXIT = {}   # pc -> Paare bis zum naechsten moeglichen Ausgang des Abschnitts (0 = dieses Paar)
+MARK_USED = set()  # (pc, schluessel): Marke wird von einer Laufzeitpruefung im selben Abschnitt gelesen
+INFLIGHT = {}      # Einstieg -> Schluessel, die dort noch unterwegs sein koennen (Stufe 2); None = unbekannt (alle)
+STATIK2 = os.environ.get("VU1REC_STATIK2", "1") == "1"
 ENTRIES5 = set()
 BACKUP_SETTERS = set()
 START_PCS = {}  # hash -> Startadressen (vu1_index.txt)
@@ -1395,10 +1492,37 @@ def emit6(lines, w, indent):
             FALLBACK[0] = True
         w(indent + line)
 
-def gen_pair3(d, w, covered, prev):
+TICK = "\0TICK"  # Platzhalter: hier vergeht ein Takt (statische Planung sammelt ihn)
+NEED_CYC = re.compile(r"m_cycle|fmac5<\d+, \d+, \d+, 1, |clip5\(|commitReady\(|commitAll\(|handBack\(|queueQ\(|xgkickNow\(|budgetEnd|\breturn\b|goto dispatch3")
+Q_USE = re.compile(r"v\.m_state\.q\)|fmac5<\d+, 1, |queueQ\(")
+
+def flush_pair(lines, w):
+    """Statische Taktplanung: TICK-Platzhalter sammeln, den Zaehler nur vor Zeilen nachfuehren, die ihn brauchen
+    (Marken, Flag-Ring, Q, XGKICK, Ausgaenge, Spruenge zu Einstiegen)."""
+    def sync():
+        if PEND[0]:
+            w("            v.m_cycle += %du;" % PEND[0]); PEND[0] = 0
+    for l in lines:
+        if l == TICK:
+            PEND[0] += 1; continue
+        t = l.strip()
+        if NEED_CYC.search(l):
+            sync()
+        else:
+            m = re.search(r"goto M_([0-9a-f]{4});", l)
+            if m and int(m.group(1), 16) in ENTRIES5:
+                sync()
+        w(l)
+
+def gen_pair3(d, w_out, covered, prev):
     global CUR_PC
     CUR_PC = d.pc
     P = d.pc
+    statik = STATIK and STUFE >= 5
+    lines = []
+    w = lines.append if statik else w_out
+    if statik and P in ENTRIES5 and PEND[0]:
+        raise SystemExit("interner Fehler: Taktzaehler am Einstieg %04x nicht nachgefuehrt (%d)" % (P, PEND[0]))
     if STUFE >= 6 and P in ENTRIES5:
         SH.clear(); SHA[0] = False
     LAST_FMAC[0] = None; FALLBACK[0] = False
@@ -1408,6 +1532,7 @@ def gen_pair3(d, w, covered, prev):
     if d.uu.reserved or d.lu.reserved:
         w("            v.m_state.pc = 0x%04xu; fr.commitAll(v); v.m_flagsLive = true; return 1;" % P)
         w("        }")
+        if statik: flush_pair(lines, w_out)
         return
     calc = ready_expr(d)
     calc = [c for c in calc if "m_xgkick" not in c]  # XGKICK laeuft sofort komplett: keine Wartezeit
@@ -1420,7 +1545,11 @@ def gen_pair3(d, w, covered, prev):
         calc = [c for c in calc if keep(c)]
     if len(calc) > 2:
         w("            { %s" % " ".join(c for c in calc if not c.startswith("return")).replace("uint64_t r = v.m_cycle;", "uint64_t r = v.m_cycle;"))
-        w("              if (r > v.m_cycle) { v.m_cycle = r; if (v.m_cycle >= v.m_nextCommit) v.commitReadyPipelines(); } }")
+        if statik:
+            w("              if (r > v.m_cycle) v.m_cycle = r; }")
+        else:
+            w("              if (r > v.m_cycle) { v.m_cycle = r; if (v.m_cycle >= v.m_nextCommit) v.commitReadyPipelines(); } }")
+    body_start = len(lines) if statik else None
     W = next((r for r in range(1, 16) if d.lu.viWrite & (1 << r)), 0)
     UW, UWL = d.uu.wreg, d.uu.wlanes
     LW, LWL = d.lu.wreg, d.lu.wlanes
@@ -1482,7 +1611,14 @@ def gen_pair3(d, w, covered, prev):
         gen_mark(d, w, W, hasUpperWrite, hasLowerWrite, UW, UWL, LW, LWL)
     if STUFE < 5 or needs_vf0_reset(d):
         w("            v.m_state.vf[0][0] = 0.0f; v.m_state.vf[0][1] = 0.0f; v.m_state.vf[0][2] = 0.0f; v.m_state.vf[0][3] = 1.0f; v.m_state.vi[0] = 0;")
-    w("            ++v.m_cycle; if (v.m_cycle >= v.m_nextCommit) v.commitReadyPipelines();")
+    if statik:
+        # Q (DIV/RSQRT/SQRT-Ergebnis) wird im Interpreter von commitReadyPipelines vor dem Paar sichtbar; hier explizit
+        # vor jedem Paar, das Q liest oder die Q-Pipeline neu belegt (nach dem Warten auf die belegte Einheit)
+        if any(Q_USE.search(x) for x in lines[body_start:]):
+            lines.insert(body_start, "            if (v.m_fdiv.valid && v.m_fdiv.readyCycle <= v.m_cycle) v.publishQ();")
+        w(TICK)
+    else:
+        w("            ++v.m_cycle; if (v.m_cycle >= v.m_nextCommit) v.commitReadyPipelines();")
     # Kontrollfluss
     nxt = (P + 8) & 0x3FFF
     pc_ = prev.get(P)  # Vorgaengerpaar (Verzoegerungsplatz?)
@@ -1503,6 +1639,7 @@ def gen_pair3(d, w, covered, prev):
     else:
         w("            v.m_state.pc = 0x%04xu; fr.commitAll(v); v.m_flagsLive = true; return 1;" % nxt)
     w("        }")
+    if statik: flush_pair(lines, w_out)
 
 def program3_ok(pairs):
     """Stufe 3 nur, wenn der Fluss statisch sauber ist (kein Sprung im Verzoegerungsplatz, Platz abgedeckt, keine D/T-Bits)."""
@@ -1589,11 +1726,15 @@ def _gen_program3(h, pairs, out):
             exits.add(p.pc)
         if slot not in cov:
             exits.add(p.pc)
+    if STUFE >= 5:
+        analyse_dist(pairs, entries, exits)
+        analyse_inflight(pairs, entries, exits, prev)
     if STUFE >= 4:
         analyse_blocks(pairs, entries, exits)
     if STUFE >= 5:
         analyse_recpend(pairs, entries, exits)
     ENTRIES5.clear(); ENTRIES5.update(entries)
+    PEND[0] = 0
     ENTRY_MAPS[h] = sorted(e for e in entries if e in cov) if STUFE >= 4 else sorted(cov)
     BACKUP_SETTERS.clear()
     for p in pairs:
@@ -1607,7 +1748,11 @@ def _gen_program3(h, pairs, out):
     else:
         DEAD_FLAGS.clear()
     w("    // Stufe %d" % (4 if STUFE >= 4 else 3))
-    w("    if (v.m_state.branchPending || v.m_state.ebit || v.m_state.haltAfterDelaySlot || v.hasPendingRegWrites()) return 1;")
+    if STATIK and STUFE >= 5:
+        # ohne Takt-Pruefung je Paar duerfen keine Interpreter-Warteschlangen (Flags, Speicherungen, ACC) offen sein
+        w("    if (v.m_state.branchPending || v.m_state.ebit || v.m_state.haltAfterDelaySlot || v.hasPendingRegWrites() || v.hasPendingOther()) return 1;")
+    else:
+        w("    if (v.m_state.branchPending || v.m_state.ebit || v.m_state.haltAfterDelaySlot || v.hasPendingRegWrites()) return 1;")
     w("    FlagRing fr;")
     if STUFE >= 5:
         w("    ClipRing cr;")
