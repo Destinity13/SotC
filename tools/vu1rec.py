@@ -42,6 +42,10 @@ FLAG_TARGET = "pipe"
 COVERED = set()
 STUFE3_OK = set()
 HEADS = set()
+SH = {}        # Stufe 6: Register mit gueltigem normalisierten Schatten sh[reg]
+SHA = [False]  # Stufe 6: ACC-Schatten gueltig
+LAST_FMAC = [None]  # (fd oder 'acc') des zuletzt ausgegebenen fmac6, sonst None
+FALLBACK = [False]  # Stufe 6: im aktuellen Paar wurde auf execUpper/execLower zurueckgefallen
 
 def lanes_of(dest):
     return [c for c in range(4) if dest & LANE[c]]
@@ -178,6 +182,29 @@ def lower_inline(L, pc):
         if vit == 0:
             return []
         return ["v.m_state.vi[%d] = (int16_t)(v.m_state.vi[%d] %s (%d));" % (vit, vis, "+" if opHi == 0x08 else "-", imm)]
+    # Flag-/Clip-Leser (bitgleich zu execLower; der Flag-Ring ist vorher eingetragen, siehe lower3_inline)
+    imm24 = L & 0xFFFFFF
+    imm12 = (((L >> 21) & 1) << 11) | (L & 0x7FF)
+    if opHi == 0x12:  # FCAND
+        return ["v.m_state.vi[1] = ((v.m_state.clip & 0x%06xu) != 0u) ? 1 : 0;" % imm24]
+    if opHi == 0x13:  # FCOR
+        return ["v.m_state.vi[1] = ((v.m_state.clip | 0x%06xu) == 0xFFFFFFu) ? 1 : 0;" % imm24]
+    if opHi == 0x10:  # FCEQ
+        return ["v.m_state.vi[1] = ((v.m_state.clip & 0xFFFFFFu) == 0x%06xu) ? 1 : 0;" % imm24]
+    if opHi == 0x1C:  # FCGET
+        return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)(v.m_state.clip & 0x0FFFu);" % vit]
+    if opHi == 0x14:  # FSEQ
+        return [] if vit == 0 else ["v.m_state.vi[%d] = ((v.m_state.status & 0xFFFu) == 0x%03xu) ? 1 : 0;" % (vit, imm12)]
+    if opHi == 0x16:  # FSAND
+        return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)((v.m_state.status & 0xFFFu) & 0x%03xu);" % (vit, imm12)]
+    if opHi == 0x17:  # FSOR
+        return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)((v.m_state.status & 0xFFFu) | 0x%03xu);" % (vit, imm12)]
+    if opHi == 0x18:  # FMEQ
+        return [] if vit == 0 else ["v.m_state.vi[%d] = ((v.m_state.mac & 0xFFFFu) == (uint32_t)(uint16_t)v.m_state.vi[%d]) ? 1 : 0;" % (vit, vis)]
+    if opHi == 0x1A:  # FMAND
+        return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)(v.m_state.mac & (uint32_t)(uint16_t)v.m_state.vi[%d]);" % (vit, vis)]
+    if opHi == 0x1B:  # FMOR
+        return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)(v.m_state.mac | (uint32_t)(uint16_t)v.m_state.vi[%d]);" % (vit, vis)]
     target = (pc + 8 + imm11 * 8) & 0x3FFF
     take = "{ v.m_state.branchPending = true; v.m_state.branchTarget = 0x%04xu; v.m_state.branchDelay = 1; }" % target
     if opHi == 0x20:  # B
@@ -218,6 +245,40 @@ def lower_inline(L, pc):
             if vit != 0:
                 lines.append("v.m_state.vi[%d] = (int16_t)(v.m_state.vi[%d] + 1);" % (vit, vit))
             return lines
+        fsf, ftf = (L >> 21) & 3, (L >> 23) & 3
+        if sp == 0x38:  # DIV (Q-Pipeline, Latenz 7)
+            return ["{ const float num = vu1NormalizeOperandInline(v.m_state.vf[%d][%d]); const float den = vu1NormalizeOperandInline(v.m_state.vf[%d][%d]);" % (fs, fsf, ft, ftf),
+                    "  uint32_t di = 0u; float r;",
+                    "  if (den == 0.0f) { di = num == 0.0f ? 0x10u : 0x20u; r = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max(); }",
+                    "  else r = num / den;",
+                    "  v.queueQ(r, 7u, di); }"]
+        if sp == 0x3A:  # RSQRT (Q-Pipeline, Latenz 13)
+            return ["{ const float num = vu1NormalizeOperandInline(v.m_state.vf[%d][%d]); const float rad = vu1NormalizeOperandInline(v.m_state.vf[%d][%d]);" % (fs, fsf, ft, ftf),
+                    "  const float den = std::sqrt(std::fabs(rad)); uint32_t di = rad < 0.0f ? 0x10u : 0u; float r;",
+                    "  if (den != 0.0f) r = num / den;",
+                    "  else { di = num == 0.0f ? 0x10u : 0x20u; r = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max(); }",
+                    "  v.queueQ(r, 13u, di); }"]
+        if sp == 0x39:  # SQRT (Q-Pipeline, Latenz 7)
+            return ["{ const float val = vu1NormalizeOperandInline(v.m_state.vf[%d][%d]); v.queueQ(std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u); }" % (ft, ftf)]
+        if sp == 0x3B:  # WAITQ: das Warten steckt in der Bereitschaftsrechnung vor dem Paar
+            return []
+        if sp == 0x3C:  # MTIR
+            return [] if vit == 0 else ["{ uint32_t f; std::memcpy(&f, &v.m_state.vf[%d][%d], 4); v.m_state.vi[%d] = (int32_t)(int16_t)(f & 0xFFFFu); }" % (fs, fsf, vit)]
+        if sp == 0x3D:  # MFIR
+            return ["{ const int32_t val = (int32_t)(int16_t)(v.m_state.vi[%d] & 0xFFFF); float fv; std::memcpy(&fv, &val, 4);" % vis] + \
+                   ["  v.m_state.vf[%d][%d] = fv;" % (ft, c) for c in lanes_of(dest)] + ["}"]
+        if sp == 0x3E:  # ILWR
+            comp = 0 if dest & 8 else 1 if dest & 4 else 2 if dest & 2 else 3
+            if vit == 0:
+                return []
+            return ["{ uint32_t addr = ((uint32_t)(uint16_t)v.m_state.vi[%d]) * 16u; addr &= (dataSize - 1);" % vis,
+                    "  if (addr + 16 <= dataSize) { uint32_t wv; std::memcpy(&wv, vuData + addr + %d, 4); v.m_state.vi[%d] = (int32_t)(int16_t)(wv & 0xFFFFu); } }" % (comp * 4, vit)]
+        if sp == 0x68:  # XTOP
+            return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)(v.m_state.top & 0x3FFu);" % vit]
+        if sp == 0x69:  # XITOP
+            return [] if vit == 0 else ["v.m_state.vi[%d] = (int32_t)(v.m_state.itop & 0x3FFu);" % vit]
+        if sp == 0x64:  # MFP
+            return ["{ const float pv = v.m_state.p;"] + ["  v.m_state.vf[%d][%d] = pv;" % (ft, c) for c in lanes_of(dest)] + ["}"]
         if sp == 0x31:  # MR32
             return ["{ const float tmp[4] = {v.m_state.vf[%d][1], v.m_state.vf[%d][2], v.m_state.vf[%d][3], v.m_state.vf[%d][0]};" % (fs, fs, fs, fs)] + \
                    ["  v.m_state.vf[%d][%d] = tmp[%d];" % (ft, c, c) for c in lanes_of(dest)] + ["}"]
@@ -243,7 +304,7 @@ def upper_call5(U):
         if sp == 0x1D:  # ABS
             return [pre5, "abs5(v, %du, %du, %du);" % (ft, fs, D)]
         if sp == 0x1F:  # CLIP (Flag-Pipeline des Interpreters)
-            return [pre5, "clip5(v, %du, %du);" % (fs, ft)]
+            return [pre5, "clip5(v, cr, %du, %du);" % (fs, ft)]
         toacc = 1
         if sp < 0x10:
             kind, src, bc = ["ADD", "SUB", "MADD", "MSUB"][sp >> 2], 0, sp & 3
@@ -279,8 +340,104 @@ def upper_call5(U):
             kind, src, bc = {0x28: "ADD", 0x29: "MADD", 0x2A: "MUL", 0x2C: "SUB", 0x2D: "MSUB"}[op], 3, 0
         else:
             return None
+    live = 0 if CUR_PC in DEAD_FLAGS else 1
+    if STUFE >= 6:
+        lines = ["/* U %08x */" % U]
+        sv = sh_src(fs, lines)
+        if src == 0:
+            tv = ("_mm_set1_ps(%s)" % ("1.0f" if bc == 3 else "0.0f")) if ft == 0 else "vu6Bc<%d>(%s)" % (bc, sh_src(ft, lines))
+        elif src == 1:
+            tv = "_mm_set1_ps(vu1NormalizeOperandInline(v.m_state.q))"
+        elif src == 2:
+            tv = "_mm_set1_ps(vu1NormalizeOperandInline(v.m_state.i))"
+        else:
+            tv = sh_src(ft, lines)
+        av = sh_acc(lines) if K[kind] >= 3 else sv
+        if toacc:
+            lines.append("sha = fmac6<%d, %d>(v, fr, %s, %s, %s, v.m_state.acc, %du);" % (K[kind], live, sv, tv, av, REV4[dest]))
+            SHA[0] = True
+            LAST_FMAC[0] = "acc"
+        elif fd == 0:
+            lines.append("(void)fmac6<%d, %d>(v, fr, %s, %s, %s, v.m_state.vf[0], %du);" % (K[kind], live, sv, tv, av, REV4[dest]))
+            LAST_FMAC[0] = 0
+        else:
+            lines.append("sh[%d] = fmac6<%d, %d>(v, fr, %s, %s, %s, v.m_state.vf[%d], %du);" % (fd, K[kind], live, sv, tv, av, fd, REV4[dest]))
+            SH[fd] = True
+            LAST_FMAC[0] = fd
+        return lines
     return ["/* U %08x */" % U,
-            "fmac5<%d, %d, %d, %d>(v, fr, %du, %du, %du, %du, %du);" % (K[kind], src, toacc, 0 if CUR_PC in DEAD_FLAGS else 1, fd, fs, ft, bc, REV4[dest])]
+            "fmac5<%d, %d, %d, %d>(v, fr, %du, %du, %du, %du, %du);" % (K[kind], src, toacc, live, fd, fs, ft, bc, REV4[dest])]
+
+def sh_src(reg, lines):
+    """normalisierter Vektor eines VF-Registers (Stufe 6): Schatten anlegen, falls noch keiner gilt"""
+    if reg == 0:
+        return "kVu6Vf0"
+    if reg not in SH:
+        lines.append("sh[%d] = vu5Norm(_mm_loadu_ps(v.m_state.vf[%d]));" % (reg, reg))
+        SH[reg] = True
+    return "sh[%d]" % reg
+
+def sh_acc(lines):
+    if not SHA[0]:
+        lines.append("sha = vu5Norm(_mm_loadu_ps(v.m_state.acc));")
+        SHA[0] = True
+    return "sha"
+
+
+FMAC6 = r"""
+// Stufe 6: schlanker FMAC. Voraussetzung: der Thread laeuft mit FTZ+DAZ (wie die VU: keine Denormalen), die
+// Operanden sind bereits normalisiert ("Schatten": Exponent 0 -> +-0, 255 -> +-Max; ein Register wird nur beim
+// ersten Lesen normalisiert und danach wiederverwendet, FMAC-Ergebnisse sind von sich aus sauber).
+// Unterlauf wird von FTZ zu +-0 gespuelt (wie der Interpreter), Ueberlauf (+-Inf) auf +-Max geklemmt; NaN kann
+// nicht entstehen, weil kein Operand unendlich ist. Flags nur, wenn jemand sie liest.
+static const __m128 kVu6Vf0 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+template <int BC> static __attribute__((always_inline)) inline __m128 vu6Bc(__m128 x) { return _mm_shuffle_ps(x, x, _MM_SHUFFLE(BC, BC, BC, BC)); }
+template <int K, int LIVE>
+__m128 VU1Interpreter::Compiled::fmac6(VU1Interpreter &v, FlagRing &fr, __m128 s, __m128 t, __m128 a, float *dst, uint32_t dm)
+{
+    __m128 r, p = s;
+    if constexpr (K == 0) r = _mm_add_ps(s, t);
+    else if constexpr (K == 1) r = _mm_sub_ps(s, t);
+    else if constexpr (K == 2) r = _mm_mul_ps(s, t);
+    else { p = _mm_mul_ps(s, t); r = (K == 3) ? _mm_add_ps(a, p) : _mm_sub_ps(a, p); }
+    const __m128 maxv = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
+    const __m128 absr = _mm_and_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+    const __m128 ovf = _mm_cmpeq_ps(absr, _mm_castsi128_ps(_mm_set1_epi32(0x7F800000)));
+    r = _mm_min_ps(_mm_max_ps(r, _mm_xor_ps(maxv, _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u)))), maxv);
+    if (LIVE || v.m_flagsLive)
+    {
+        if (v.m_flagsLive)
+        {
+            const __m128 zero = _mm_cmpeq_ps(absr, _mm_setzero_ps());
+            // Unterlauf: Ergebnis 0, aber nicht durch exakte Ausloeschung (Vorzeichen-Nullen sind bei FTZ exakt)
+            __m128 exakt;
+            const __m128 neg = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+            if constexpr (K == 0) exakt = _mm_cmpeq_ps(s, _mm_xor_ps(t, neg));
+            else if constexpr (K == 1) exakt = _mm_cmpeq_ps(s, t);
+            else if constexpr (K == 2) exakt = _mm_or_ps(_mm_cmpeq_ps(s, _mm_setzero_ps()), _mm_cmpeq_ps(t, _mm_setzero_ps()));
+            else if constexpr (K == 3) exakt = _mm_cmpeq_ps(a, _mm_xor_ps(p, neg));
+            else exakt = _mm_cmpeq_ps(a, p);
+            const __m128 und = _mm_andnot_ps(exakt, zero);
+            const uint32_t zm = (uint32_t)_mm_movemask_ps(zero) & dm;
+            const uint32_t sm = (uint32_t)_mm_movemask_ps(r) & dm;
+            const uint32_t um = (uint32_t)_mm_movemask_ps(und) & dm;
+            const uint32_t om = (uint32_t)_mm_movemask_ps(ovf) & dm;
+            const uint32_t st = (zm ? 1u : 0u) | (sm ? 2u : 0u) | (um ? 4u : 0u) | (om ? 8u : 0u);
+            if constexpr (LIVE)
+            {
+                const uint32_t mac = kVu5Rev[zm] | (kVu5Rev[sm] << 4) | (kVu5Rev[um] << 8) | (kVu5Rev[om] << 12);
+                fr.push(v, v.m_cycle, mac, st);
+            }
+            else
+                v.m_state.status |= st << 6;
+        }
+    }
+    const __m128i lm = _mm_set_epi32((dm & 8) ? -1 : 0, (dm & 4) ? -1 : 0, (dm & 2) ? -1 : 0, (dm & 1) ? -1 : 0);
+    const __m128 res = _mm_blendv_ps(_mm_loadu_ps(dst), r, _mm_castsi128_ps(lm));
+    _mm_storeu_ps(dst, res);
+    return res;
+}
+"""
 
 FMAC5 = r'''
 // Stufe 5: gemeinsamer FMAC-Helfer (SSE, alle 4 Lanes auf einmal, Ergebnis nur in die dest-Lanes).
@@ -397,7 +554,7 @@ void VU1Interpreter::Compiled::maxmin5(VU1Interpreter &v, uint32_t fd, uint32_t 
     vu5Write(v.m_state.vf[fd], ISMAX ? _mm_max_ps(s, t) : _mm_min_ps(s, t), dm);
 }
 // CLIP: wie execUpper (rohe Bits, nicht normalisiert), Ergebnis in die Flag-Pipeline des Interpreters
-void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, uint32_t fs, uint32_t ft)
+void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, ClipRing &cr, uint32_t fs, uint32_t ft)
 {
     uint32_t wBits; std::memcpy(&wBits, &v.m_state.vf[ft][3], 4);
     const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
@@ -408,7 +565,9 @@ void VU1Interpreter::Compiled::clip5(VU1Interpreter &v, uint32_t fs, uint32_t ft
         if ((int32_t)b > limit) flags |= 1u << (2 * c);
         if ((int32_t)(b ^ 0x80000000u) > limit) flags |= 2u << (2 * c);
     }
-    v.queueClip(flags);
+    // wie queueClip: Arbeitswert schieben, Eintrag wird 4 Takte spaeter sichtbar (lokaler Ring statt Pipeline)
+    v.m_workingClip = ((v.m_workingClip << 6) | (flags & 0x3Fu)) & 0xFFFFFFu;
+    cr.push(v, v.m_cycle, v.m_workingClip);
 }
 '''
 
@@ -549,16 +708,52 @@ def gen_exec_exact(d, w, W, hasUpperWrite, hasDistinctLowerWrite, UW, UWL, LW, L
         lat = d.lu.viLat or d.lu.lat
         w("            { const int32_t nvi = v.m_state.vi[%d]; v.m_state.vi[%d] = oldVi; v.queueViWrite(%d, nvi, %d); }" % (W, W, W, lat))
 
+def rec_lat(d):
+    """groesste Ergebnis-Latenz eines Paars (fuer m_recPend: Programmende wartet darauf), 0 = keine"""
+    W = next((r for r in range(1, 16) if d.lu.viWrite & (1 << r)), 0)
+    UW, LW = d.uu.wreg, d.lu.wreg
+    hasUpperWrite = UW != 0
+    hasLowerWrite = LW != 0 and d.suppressed != LW
+    lats = []
+    if hasUpperWrite: lats.append(d.uu.vfLat or d.uu.lat)
+    if hasLowerWrite and (not hasUpperWrite or LW != UW): lats.append(d.lu.vfLat or d.lu.lat)
+    if d.uu.accWrite: lats.append(1)
+    if W: lats.append(d.lu.viLat or d.lu.lat)
+    return max(lats) if lats else 0
+
+RECPEND_DEAD = set()  # Stufe 5: Paare, deren m_recPend-Aktualisierung von einem spaeteren Paar im Block sicher ueberboten wird
+
+def analyse_recpend(pairs, entries, exits):
+    """Zwischen Paar i und einem spaeteren Paar j desselben geradlinigen Abschnitts vergehen mindestens j-i Takte.
+    Gilt lat_j + (j-i) >= lat_i, liegt cycle_j + lat_j sicher nicht unter cycle_i + lat_i: die Speicherung bei i ist
+    ueberfluessig. Abschnitte enden an Einstiegen, Luecken und moeglichen Ausgaengen."""
+    RECPEND_DEAD.clear()
+    seg = []
+    def done():
+        best = -10**9  # max ueber spaetere j von (lat_j + j)
+        for idx in range(len(seg) - 1, -1, -1):
+            pc, L = seg[idx]
+            if L and best - idx >= L:
+                RECPEND_DEAD.add(pc)
+            if L:
+                best = max(best, L + idx)
+        seg.clear()
+    lastpc = None
+    for p in pairs:
+        if p.pc in entries or lastpc is None or p.pc != ((lastpc + 8) & 0x3FFF):
+            done()
+        seg.append((p.pc, rec_lat(p)))
+        if p.pc in exits:
+            done()
+        lastpc = p.pc
+    done()
+
 def gen_mark(d, w, W, hasUpperWrite, hasLowerWrite, UW, UWL, LW, LWL):
     if STUFE >= 2:
         # Interpreter haette diese Schreibvorgaenge bis zu ihrem Fertig-Zyklus in der Warteschlange (Programmende wartet darauf)
-        lats = []
-        if hasUpperWrite: lats.append(d.uu.vfLat or d.uu.lat)
-        if hasLowerWrite and (not hasUpperWrite or LW != UW): lats.append(d.lu.vfLat or d.lu.lat)
-        if d.uu.accWrite: lats.append(1)
-        if W: lats.append(d.lu.viLat or d.lu.lat)
-        if lats:
-            w("            if (v.m_cycle + %du > v.m_recPend) v.m_recPend = v.m_cycle + %du;" % (max(lats), max(lats)))
+        L = rec_lat(d)
+        if L and not (STUFE >= 5 and FLAG_TARGET == "ring" and d.pc in RECPEND_DEAD):
+            w("            if (v.m_cycle + %du > v.m_recPend) v.m_recPend = v.m_cycle + %du;" % (L, L))
     if hasLowerWrite:
         lat = d.lu.vfLat or d.lu.lat
         for c in range(4):
@@ -576,7 +771,10 @@ def gen_mark(d, w, W, hasUpperWrite, hasLowerWrite, UW, UWL, LW, LWL):
         if d.uu.accWrite & LANE[c]:
             w("            v.m_accReady[%d] = v.m_cycle + 1;" % c)
     if W and d.lu.delayBr:
-        w("            v.recordViWriteForBranch(%d, oldVi);" % W)
+        if FLAG_TARGET == "ring":
+            w("            v.m_viBranchBackupValue = oldVi; v.m_viBranchBackupReg = %d; v.m_viBranchBackupValid = true;" % W)
+        else:
+            w("            v.recordViWriteForBranch(%d, oldVi);" % W)
 
 def gen_tail(d, w):
     w("            v.m_state.vf[0][0] = 0.0f; v.m_state.vf[0][1] = 0.0f; v.m_state.vf[0][2] = 0.0f; v.m_state.vf[0][3] = 1.0f; v.m_state.vi[0] = 0;")
@@ -666,6 +864,8 @@ def main():
     w("#include <cstring>")
     w("#include <cstdlib>")
     w("#include <cstdio>")
+    w("#include <cmath>")
+    w("#include <limits>")
     w("#include <immintrin.h>")
     w("")
     w("static inline bool vu1Fast() { static const bool f = [] { const char *e = std::getenv(\"PS2X_VU1_FAST\"); return e && *e && *e != '0'; }(); return f; }")
@@ -680,11 +880,16 @@ def main():
         w("    template <int SH> static __attribute__((always_inline)) inline void ftoi5(VU1Interpreter &v, uint32_t ft, uint32_t fs, uint32_t dm);")
         w("    static __attribute__((always_inline)) inline void abs5(VU1Interpreter &v, uint32_t ft, uint32_t fs, uint32_t dm);")
         w("    template <int ISMAX, int SRC> static __attribute__((always_inline)) inline void maxmin5(VU1Interpreter &v, uint32_t fd, uint32_t fs, uint32_t ft, uint32_t bc, uint32_t dm);")
-        w("    static __attribute__((always_inline)) inline void clip5(VU1Interpreter &v, uint32_t fs, uint32_t ft);")
+        w("    struct ClipRing;")
+        w("    static __attribute__((always_inline)) inline void clip5(VU1Interpreter &v, ClipRing &cr, uint32_t fs, uint32_t ft);")
+    if STUFE >= 6:
+        w("    template <int K, int LIVE> static __attribute__((always_inline)) inline __m128 fmac6(VU1Interpreter &v, FlagRing &fr, __m128 s, __m128 t, __m128 a, float *dst, uint32_t dm);")
     for h, pairs, c, live in progs:
         w("    static int run_%s(VU1Interpreter &v, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint64_t budgetEnd, bool &programEnded);" % h)
     w("};")
     w(FLAGRING.replace("struct FlagRing", "struct VU1Interpreter::Compiled::FlagRing", 1).replace("static void apply(", "static void apply(", 1))
+    if STUFE >= 5:
+        w(CLIPRING)
     w("void VU1Interpreter::Compiled::FlagRing::apply(VU1Interpreter &v, uint32_t mac, uint32_t st)")
     w("{")
     w("    // wie commitReadyPipelines fuer einen FMAC-Eintrag (writesMac, writesStatus, extraSticky = 0)")
@@ -695,6 +900,8 @@ def main():
     w("")
     if STUFE >= 5:
         w(FMAC5)
+    if STUFE >= 6:
+        w(FMAC6)
     for h, pairs, c, live in progs:
         w("// Programm %s: %d Paare, %.1f %% der VU1-Zyklen im Mitschnitt" % (h, len(pairs), 100.0 * c / tot))
         w("int VU1Interpreter::Compiled::run_%s(VU1Interpreter &v, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint64_t budgetEnd, bool &programEnded)" % h)
@@ -792,6 +999,9 @@ def lower3_inline(d, w):
     if not (L >> 31) and op in FLAG_READERS:
         w("            fr.commitReady(v, v.m_cycle);")
         return False  # Interpreter-Befehl liest danach den eingetragenen Zustand
+    if STUFE >= 5 and not (L >> 31) and op in (0x10, 0x12, 0x13, 0x1C):  # FCEQ FCAND FCOR FCGET
+        w("            cr.commitReady(v, v.m_cycle);")
+        return False
     if (L >> 31) and (L & 0x3F) >= 0x3C:
         sp = (L & 3) | ((L >> 4) & 0x7C)
         if sp == 0x6C:  # XGKICK sofort
@@ -979,10 +1189,19 @@ def flag_liveness(pairs, prev):
         if not live:
             DEAD_FLAGS.add(k)
 
+def emit6(lines, w, indent):
+    for line in lines:
+        if "v.execLower(" in line or "v.execUpper(" in line:
+            FALLBACK[0] = True
+        w(indent + line)
+
 def gen_pair3(d, w, covered, prev):
     global CUR_PC
     CUR_PC = d.pc
     P = d.pc
+    if STUFE >= 6 and P in ENTRIES5:
+        SH.clear(); SHA[0] = False
+    LAST_FMAC[0] = None; FALLBACK[0] = False
     w("        M_%04x: {" % P)
     if P in HEADS:
         w("            if (v.m_cycle >= budgetEnd || v.m_stopRequested) { v.m_state.pc = 0x%04xu; fr.commitAll(v); return 0; }" % P)
@@ -1014,8 +1233,10 @@ def gen_pair3(d, w, covered, prev):
         ui = upper_call5(U) if STUFE >= 5 else None
         if ui is None:
             ui = upper_inline(U)
-        for line in (ui if ui is not None else ["v.execUpper(0x%08xu);" % U]):
-            w("            " + line)
+        lines = ui if ui is not None else ["v.execUpper(0x%08xu);" % U]
+        if not any("v.execUpper(" in x for x in lines):
+            lines = [x for x in lines if not x.startswith("v.m_currentUpperInstruction")]
+        emit6(lines, w, "            ")
     if d.iBit:
         emit_upper()
         w("            { const uint32_t bits = 0x%08xu; float imm; std::memcpy(&imm, &bits, 4); v.m_state.i = vu1NormalizeOperandInline(imm); }" % L)
@@ -1026,15 +1247,26 @@ def gen_pair3(d, w, covered, prev):
         w("              std::memcpy(upperVf, v.m_state.vf[%d], 16); std::memcpy(v.m_state.vf[%d], oldVf, 16);" % (S, S))
         if not lower3_inline(d, w):
             li = lower_inline(L, P)
-            for line in (li if li is not None else ["v.execLower(0x%08xu, vuData, dataSize, gs, memory, 0x%08xu);" % (L, U)]):
-                w("              " + line)
+            emit6(li if li is not None else ["v.execLower(0x%08xu, vuData, dataSize, gs, memory, 0x%08xu);" % (L, U)], w, "              ")
         w("              std::memcpy(v.m_state.vf[%d], upperVf, 16); }" % S)
     else:
         emit_upper()
         if not lower3_inline(d, w):
             li = lower_inline(L, P)
-            for line in (li if li is not None else ["v.execLower(0x%08xu, vuData, dataSize, gs, memory, 0x%08xu);" % (L, U)]):
-                w("            " + line)
+            emit6(li if li is not None else ["v.execLower(0x%08xu, vuData, dataSize, gs, memory, 0x%08xu);" % (L, U)], w, "            ")
+    if STUFE >= 6:
+        # Schatten nach diesem Paar: Rueckfall auf den Interpreter oder Doppelschreiber -> alles verwerfen;
+        # sonst werden vom Nicht-FMAC-Oberbefehl und vom Unterbefehl beschriebene Register schmutzig.
+        if FALLBACK[0] or d.shadow:
+            SH.clear(); SHA[0] = False
+        else:
+            if LAST_FMAC[0] is None:
+                if UW:
+                    SH.pop(UW, None)
+                if d.uu.accWrite:
+                    SHA[0] = False
+            if LW:
+                SH.pop(LW, None)
     if STUFE < 5 or P in ENTRIES5 or ((P - 8) & 0x3FFF) in BACKUP_SETTERS:
         w("            v.m_viBranchBackupValid = false;")
     if STUFE >= 4 and BLOCK_DEAD.get(P):
@@ -1094,14 +1326,21 @@ def program3_ok(pairs):
 def gen_program3(h, pairs, out):
     global HEADS, FLAG_TARGET
     FLAG_TARGET = "ring"
+    start = len(out)
     try:
         _gen_program3(h, pairs, out)
     finally:
         FLAG_TARGET = "pipe"
+    if STUFE >= 5:
+        for k in range(start, len(out)):
+            if "fr.commitAll(v);" in out[k]:
+                out[k] = out[k].replace("fr.commitAll(v);", "fr.commitAll(v); cr.handBack(v);")
 
 def _gen_program3(h, pairs, out):
     global HEADS
     w = out.append
+    if STUFE >= 5 and any(not (p.lower >> 31) and (p.lower >> 25) == 0x11 for p in pairs):
+        raise SystemExit("Programm %s enthaelt FCSET: Clip-Ring (Stufe 5) waere falsch - erst queueFcset im Ring nachbilden" % h)
     cov = {p.pc for p in pairs}
     prev = {}
     HEADS = set()
@@ -1135,6 +1374,8 @@ def _gen_program3(h, pairs, out):
             exits.add(p.pc)
     if STUFE >= 4:
         analyse_blocks(pairs, entries, exits)
+    if STUFE >= 5:
+        analyse_recpend(pairs, entries, exits)
     ENTRIES5.clear(); ENTRIES5.update(entries)
     BACKUP_SETTERS.clear()
     for p in pairs:
@@ -1150,7 +1391,12 @@ def _gen_program3(h, pairs, out):
     w("    // Stufe %d" % (4 if STUFE >= 4 else 3))
     w("    if (v.m_state.branchPending || v.m_state.ebit || v.m_state.haltAfterDelaySlot || v.hasPendingRegWrites()) return 1;")
     w("    FlagRing fr;")
+    if STUFE >= 5:
+        w("    ClipRing cr;")
     w("    bool brTake = false; uint32_t brDyn = 0; (void)brTake; (void)brDyn;")
+    if STUFE >= 6:
+        w("    __m128 sh[32]; __m128 sha; (void)sh; (void)sha;")
+        w("    if ((_mm_getcsr() & 0x8040u) != 0x8040u) _mm_setcsr(_mm_getcsr() | 0x8040u); // Stufe 6 braucht FTZ+DAZ")
     w("dispatch3:")
     w("    switch (v.m_state.pc)")
     w("    {")
@@ -1189,6 +1435,52 @@ struct FlagRing
     inline void commitAll(VU1Interpreter &v) { while (n) applyOne(v); }
 };
 '''
+
+CLIPRING = r"""
+// Clip-Ring (Stufe 5): CLIP-Ergebnisse werden wie im Interpreter 4 Takte nach Ausgabe sichtbar, aber erst beim Lesen
+// (FCAND/FCOR/FCEQ/FCGET) eingetragen. An jedem Ausgang gehen offene Eintraege mit ihren echten Takten zurueck in die
+// Interpreter-Pipeline (gleiche Sichtbarkeit, gleiches Programmende).
+struct VU1Interpreter::Compiled::ClipRing
+{
+    uint64_t cyc[8];
+    uint32_t val[8];
+    uint32_t head = 0, n = 0;
+    inline void push(VU1Interpreter &v, uint64_t c, uint32_t value)
+    {
+        if (n == 8u) { v.m_state.clip = val[head]; head = (head + 1) & 7u; --n; }
+        const uint32_t i = (head + n) & 7u;
+        cyc[i] = c; val[i] = value; ++n;
+    }
+    inline void commitReady(VU1Interpreter &v, uint64_t now)
+    {
+        while (n && cyc[head] + VU1Interpreter::kFmacLatency <= now) { v.m_state.clip = val[head]; head = (head + 1) & 7u; --n; }
+    }
+    inline void handBack(VU1Interpreter &v)
+    {
+        commitReady(v, v.m_cycle);
+        while (n)
+        {
+            bool placed = false;
+            for (auto &entry : v.m_flagPipeline)
+            {
+                if (entry.valid) continue;
+                entry = {};
+                entry.valid = true;
+                v.m_occ.flag |= 1u << static_cast<uint32_t>(&entry - v.m_flagPipeline.data());
+                entry.issueCycle = cyc[head];
+                entry.readyCycle = cyc[head] + VU1Interpreter::kFmacLatency;
+                v.noteReady(entry.readyCycle);
+                entry.clip = val[head];
+                entry.writesClip = true;
+                placed = true;
+                break;
+            }
+            if (!placed) v.m_state.clip = val[head];
+            head = (head + 1) & 7u; --n;
+        }
+    }
+};
+"""
 
 if __name__ == "__main__":
     main()

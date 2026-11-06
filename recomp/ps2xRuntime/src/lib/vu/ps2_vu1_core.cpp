@@ -1061,6 +1061,38 @@ void VU1Interpreter::progressXgkick()
     }
 }
 
+void VU1Interpreter::progressXgkickBulk()
+{
+    while (m_xgkick.active && m_activeVuData && m_activeVuDataSize != 0u)
+    {
+        if (m_xgkick.currentTagEnd == 0u || m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
+        {
+            // genau ein Quadword (GIFtag bzw. Abschluss) mit der bisherigen Logik
+            m_xgkick.cycleCredit = 1u;
+            progressXgkick();
+            continue;
+        }
+        uint32_t remaining = m_xgkick.currentTagEnd - m_xgkick.copiedBytes; // Vielfaches von 16, passt in den Puffer
+        while (remaining != 0u)
+        {
+            const uint32_t src0 = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+            uint32_t chunk = m_activeVuDataSize - src0; // bis zum Umbruch im VU-Datenspeicher
+            if (chunk > remaining)
+                chunk = remaining;
+            std::memcpy(&m_xgkick.packet[m_xgkick.copiedBytes], m_activeVuData + src0, chunk);
+            m_xgkick.copiedBytes += chunk;
+            remaining -= chunk;
+        }
+        if (m_xgkick.currentTagEop)
+            finishXgkick();
+        else
+        {
+            m_xgkick.currentTagEnd = 0u;
+            m_xgkick.currentTagEop = false;
+        }
+    }
+}
+
 void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
@@ -1142,7 +1174,17 @@ void VU1Interpreter::advanceOneCycle()
 void VU1Interpreter::advanceTo(uint64_t targetCycle)
 {
     while (m_cycle < targetCycle)
+    {
+        // Ohne laufende XGKICK-Uebertragung passiert bis zur naechsten Faelligkeit (m_nextCommit) nichts:
+        // commitReadyPipelines() und progressXgkick() kehren sofort zurueck. Direkt davor springen (bitgleich).
+        if (!m_xgkick.active)
+        {
+            const uint64_t stop = m_nextCommit < targetCycle ? m_nextCommit : targetCycle;
+            if (stop > m_cycle + 1u)
+                m_cycle = stop - 1u;
+        }
         advanceOneCycle();
+    }
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -2245,7 +2287,18 @@ vu1_run_epilogue:
     {
         // wie flushPipelines(), plus die sofort geschriebenen Ergebnisse der uebersetzten Programme
         while (pipelinesPending() || m_cycle < m_recPend)
+        {
+            // wie advanceTo: bis zur naechsten Faelligkeit passiert nichts (keine XGKICK aktiv) -> springen
+            if (!m_xgkick.active)
+            {
+                uint64_t stop = m_nextCommit;
+                if (m_cycle < m_recPend && m_recPend < stop)
+                    stop = m_recPend;
+                if (stop != UINT64_MAX && stop > m_cycle + 1u)
+                    m_cycle = stop - 1u;
+            }
             advanceOneCycle();
+        }
         m_recPend = 0;
         m_state.ebit = false;
         m_state.haltAfterDelaySlot = false;

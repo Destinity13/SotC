@@ -28,6 +28,7 @@
 #include <cstring>
 #include <limits>
 #include <chrono>
+#include <time.h>
 #include <atomic>
 #include <thread>
 #include <deque>
@@ -607,7 +608,7 @@ namespace ps2x_mtvu
     static bool g_running = false, g_quit = false, g_started = false;
     std::atomic<uint32_t> g_fbrst{0};    // VU0-FBRST zum Zeitpunkt der Uebergabe (D/T-Bit-Freigabe)
     std::atomic<uint32_t> g_stopBits{0}; // D/T-Stopp des letzten Programms
-    static std::atomic<uint64_t> g_waits{0}, g_jobCount{0}, g_waitUs{0}, g_busyUs{0};
+    static std::atomic<uint64_t> g_waits{0}, g_jobCount{0}, g_waitUs{0}, g_busyUs{0}, g_cpuUs{0};
 
     bool enabled()
     {
@@ -629,8 +630,8 @@ namespace ps2x_mtvu
         if (t0 - s_last > std::chrono::seconds(5))
         {
             s_last = t0;
-            std::fprintf(stderr, "[MTVU] %llu Auftraege, %llu Wartepunkte, EE wartete %.1f ms, Arbeiter beschaeftigt %.1f ms\n", (unsigned long long)g_jobCount.load(),
-                         (unsigned long long)n, g_waitUs.load() / 1000.0, g_busyUs.load() / 1000.0);
+            std::fprintf(stderr, "[MTVU] %llu Auftraege, %llu Wartepunkte, EE wartete %.1f ms, Arbeiter beschaeftigt %.1f ms, davon Rechenzeit %.1f ms\n", (unsigned long long)g_jobCount.load(),
+                         (unsigned long long)n, g_waitUs.load() / 1000.0, g_busyUs.load() / 1000.0, g_cpuUs.load() / 1000.0);
         }
     }
     void workerMain()
@@ -652,7 +653,10 @@ namespace ps2x_mtvu
                 g_running = true;
             }
             const auto tj = std::chrono::steady_clock::now();
+            timespec c0{}, c1{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
             job();
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1); // reine Rechenzeit des Auftrags (ohne Warten auf den GS-Thread)
+            g_cpuUs.fetch_add((uint64_t)((c1.tv_sec - c0.tv_sec) * 1000000LL + (c1.tv_nsec - c0.tv_nsec) / 1000LL), std::memory_order_relaxed);
             ::ps2xGsBridgeFlush(); // Grafikpakete dieses Auftrags abgeben
             g_busyUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tj).count(), std::memory_order_relaxed);
             bool idle;

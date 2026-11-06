@@ -234,10 +234,13 @@ private:
     // Stufe 3: XGKICK sofort komplett uebertragen (wie microVU) statt Takt fuer Takt
     void xgkickNow(uint32_t qwordAddress)
     {
-        if (m_xgkick.active) { m_xgkick.cycleCredit = 0x7FFFFFFFu; progressXgkick(); }
+        if (m_xgkick.active) progressXgkickBulk();
         startXgkick(qwordAddress);
-        if (m_xgkick.active) { m_xgkick.cycleCredit = 0x7FFFFFFFu; progressXgkick(); }
+        if (m_xgkick.active) progressXgkickBulk();
     }
+    // Uebertraegt eine laufende XGKICK sofort komplett: GIFtags einzeln ueber progressXgkick (Pruefungen wie bisher),
+    // die Nutzdaten eines Tags am Stueck. Gleiches Paket, gleiche Laenge wie Quadword fuer Quadword.
+    void progressXgkickBulk();
     bool hasPendingRegWrites() const
     {
         for (const auto &w : m_vfWritePipeline) if (w.valid) return true;
