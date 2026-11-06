@@ -2,6 +2,7 @@
 recomp/ps2xRuntime/src/runner/*
 !recomp/ps2xRuntime/src/runner/sotc_override.cpp
 recomp/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.cpp
+recomp/ps2xRuntime/src/lib/vu/ps2_vu1_compiled_t*.cpp
 recomp/output/
 recomp/sotc_config.toml
 recomp/*.log

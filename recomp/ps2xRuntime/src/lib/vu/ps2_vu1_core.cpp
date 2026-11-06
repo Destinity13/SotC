@@ -1911,7 +1911,8 @@ extern const VU1Interpreter::CompiledEntry g_vu1CompiledTable[];
 extern const uint32_t g_vu1CompiledStatusIgnore; // Status-Bits, die die uebersetzten Programme nicht fuehren (ungelesen)
 extern const size_t g_vu1CompiledCount;
 extern const uint8_t *vu1CompiledEntryMap(uint64_t hash);
-static VU1Interpreter::CompiledFn vu1LookupCompiled(uint64_t hash)
+extern VU1Interpreter::CompiledFn vu1CompiledMatch(const uint8_t *code, uint32_t size, uint64_t whole, const uint8_t **entry);
+[[maybe_unused]] static VU1Interpreter::CompiledFn vu1LookupCompiled(uint64_t hash)
 {
     for (size_t i = 0; i < g_vu1CompiledCount; ++i)
         if (g_vu1CompiledTable[i].hash == hash)
@@ -2026,6 +2027,122 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         }
         return;
     }
+    // PS2X_VU1_SELFTEST=<ordner mit vu1_<hash>.bin>: jedes uebersetzte Programm an jedem Einstieg mit Zufallsregistern und
+    // -daten einmal uebersetzt und einmal im Interpreter rechnen und bitgenau vergleichen (auch Module, die keine
+    // Teststrecke erreicht). Laeuft einmal beim ersten VU1-Aufruf; Mikrospeicher wird danach wiederhergestellt.
+    if (m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code())
+    {
+        static std::atomic<bool> s_stStarted{false};
+        const char *sdEnv = std::getenv("PS2X_VU1_SELFTEST");
+        if (sdEnv && *sdEnv && !s_stStarted.exchange(true)) [&] { // verschachtelte execute()-Aufrufe des Tests laufen normal
+            const char *sd = sdEnv;
+            const int seeds = [] { const char *e = std::getenv("PS2X_VU1_SELFTEST_N"); return (e && *e) ? std::max(1, std::atoi(e)) : 8; }();
+            std::vector<uint8_t> saveCode(vuCode, vuCode + codeSize), saveData(vuData, vuData + dataSize);
+            uint64_t rng = 0x9E3779B97F4A7C15ull;
+            auto rnd = [&rng]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+            unsigned progs = 0, cases = 0, ok = 0, skipped = 0, bad = 0;
+            std::error_code ec;
+            std::vector<std::filesystem::path> files;
+            for (const auto &e : std::filesystem::directory_iterator(sd, ec))
+                if (e.path().extension() == ".bin" && e.path().filename().string().rfind("vu1_", 0) == 0) files.push_back(e.path());
+            std::sort(files.begin(), files.end());
+            for (const auto &fp : files)
+            {
+                std::vector<uint8_t> img(codeSize, 0);
+                if (FILE *f = std::fopen(fp.c_str(), "rb")) { (void)std::fread(img.data(), 1, img.size(), f); std::fclose(f); }
+                const uint8_t *entry = nullptr;
+                const uint64_t whole = ps2x_vu1dump::fnv(img.data(), codeSize);
+                if (!vu1CompiledMatch(img.data(), codeSize, whole, &entry) || !entry) { std::fprintf(stderr, "[VU1-Selbsttest] %s: nicht uebersetzt\n", fp.filename().c_str()); continue; }
+                ++progs;
+                std::memcpy(vuCode, img.data(), codeSize);
+                unsigned pBad = 0;
+                for (uint32_t pc = 0; pc < codeSize; pc += 8u)
+                {
+                    if (!entry[pc >> 3]) continue;
+                    for (int sdn = 0; sdn < seeds; ++sdn)
+                    {
+                        ++cases;
+                        VU1State st = m_state;
+                        for (int r = 1; r < 32; ++r) for (int c = 0; c < 4; ++c) st.vf[r][c] = static_cast<float>(static_cast<int64_t>(rnd() % 20001u) - 10000) / 64.0f;
+                        for (int r = 1; r < 16; ++r) st.vi[r] = static_cast<int32_t>(rnd() % 1024u);
+                        for (int c = 0; c < 4; ++c) st.acc[c] = static_cast<float>(static_cast<int64_t>(rnd() % 2001u) - 1000) / 16.0f;
+                        std::vector<uint8_t> dA(dataSize), dB;
+                        for (uint32_t k = 0; k < dataSize; k += 4)
+                        {
+                            const uint64_t x = rnd();
+                            float fv = static_cast<float>(static_cast<int64_t>(x % 20001u) - 10000) / 32.0f;
+                            uint32_t w; std::memcpy(&w, &fv, 4);
+                            if ((x >> 40) % 4u == 0u) w = static_cast<uint32_t>(x >> 20) & 0x3FFu; // auch kleine Ganzzahlen (Zaehler, Adressen)
+                            // Jedes Quadword beginnt mit einem gueltigen GIF-Tag (EOP, NLOOP 0): ein XGKICK an beliebiger
+                            // Adresse uebertraegt dann wie im Spiel einen sauberen Tag statt Zufallsmuell
+                            if ((k & 15u) == 0u) w = 0x00008000u;
+                            else if ((k & 15u) == 4u) w = 0u;
+                            std::memcpy(dA.data() + k, &w, 4);
+                        }
+                        dB = dA;
+                        auto A = std::make_unique<VU1Interpreter>(*this);
+                        auto B = std::make_unique<VU1Interpreter>(*this);
+                        std::vector<uint8_t> capA, capB;
+                        A->m_compiledDisabled = true; A->m_gifCapture = &capA; A->m_gifSubmit = false; A->m_recGen = ~0ull; A->m_cachedCodeSize = 0u; // Decoder-Cache: Testabbild, nicht der alte Code
+                        B->m_gifCapture = &capB; B->m_gifSubmit = false; B->m_recGen = ~0ull; B->m_cachedCodeSize = 0u;
+                        A->m_state = st; B->m_state = st;
+                        const uint32_t top = static_cast<uint32_t>(rnd() % 1024u), itop = static_cast<uint32_t>(rnd() % 1024u);
+                        const uint32_t budget = 200000u;
+                        const uint64_t c0 = A->m_cycle;
+                        A->execute(vuCode, codeSize, dA.data(), dataSize, gs, memory, pc, top, itop, budget);
+                        B->execute(vuCode, codeSize, dB.data(), dataSize, gs, memory, pc, top, itop, budget);
+                        if (A->m_cycle - c0 >= budget || B->m_cycle - c0 >= budget) { ++skipped; continue; } // Endlosschleife durch Zufallsdaten
+                        const VU1State &a = B->m_state, &b = A->m_state;
+                        const char *what = nullptr;
+                        if (std::memcmp(a.vf, b.vf, sizeof(a.vf)) != 0) what = "VF";
+                        else if (std::memcmp(a.vi, b.vi, sizeof(a.vi)) != 0) what = "VI";
+                        else if (std::memcmp(a.acc, b.acc, sizeof(a.acc)) != 0) what = "ACC";
+                        else if (std::memcmp(&a.q, &b.q, 4) || std::memcmp(&a.p, &b.p, 4) || std::memcmp(&a.i, &b.i, 4) || a.r != b.r) what = "Q/P/I/R";
+                        else if (a.clip != b.clip) what = "CLIP";
+                        else if (B->m_flagsLive && (a.mac != b.mac || ((a.status ^ b.status) & ~g_vu1CompiledStatusIgnore) != 0u)) what = "MAC/STATUS";
+                        else if (a.pc != b.pc) what = "PC";
+                        else if (capA != capB) what = "XGKICK-Daten";
+                        else if (dA != dB) what = "VU-Datenspeicher";
+                        if (what)
+                        {
+                            ++bad; ++pBad;
+                            if (pBad <= 3)
+                                std::fprintf(stderr, "[VU1-Selbsttest] %s Einstieg %04x Lauf %d: %s weicht ab (pc %04x/%04x, Zyklen %llu/%llu)\n",
+                                             fp.filename().c_str(), pc, sdn, what, a.pc, b.pc, (unsigned long long)B->m_cycle, (unsigned long long)A->m_cycle);
+                        }
+                        else ++ok;
+                    }
+                }
+                std::fprintf(stderr, "[VU1-Selbsttest] %s: %u Abweichungen\n", fp.filename().c_str(), pBad);
+            }
+            std::memcpy(vuCode, saveCode.data(), codeSize);
+            std::memcpy(vuData, saveData.data(), dataSize);
+            std::fprintf(stderr, "[VU1-Selbsttest] %u Programme, %u Faelle: %u gleich, %u Abweichungen, %u uebersprungen (Budget)\n", progs, cases, ok, bad, skipped);
+        }();
+    }
+    // PS2X_VU1_DECODE=<ordner>: Mikrospeicher-Abbilder (vu1_<hash>.bin, z. B. aus tools/vu1_module.py) einmalig mit
+    // dem Decoder dieser Runtime in .dec uebersetzen (Grundlage fuer tools/vu1rec.py, ohne das Spiel zu spielen)
+    if (m_unit == Unit::VU1)
+    {
+        static std::once_flag s_dec;
+        std::call_once(s_dec, [this] {
+            const char *dd = std::getenv("PS2X_VU1_DECODE");
+            if (!dd || !*dd) return;
+            std::error_code ec; unsigned n = 0;
+            for (const auto &e : std::filesystem::directory_iterator(dd, ec))
+            {
+                const std::string fn = e.path().filename().string();
+                if (fn.size() != 24 || fn.rfind("vu1_", 0) != 0 || e.path().extension() != ".bin") continue;
+                std::filesystem::path dec = e.path(); dec.replace_extension(".dec");
+                if (std::filesystem::exists(dec)) continue;
+                std::vector<uint8_t> img(16384, 0);
+                if (FILE *f = std::fopen(e.path().c_str(), "rb")) { (void)std::fread(img.data(), 1, img.size(), f); std::fclose(f); }
+                dumpDecoded(img.data(), static_cast<uint32_t>(img.size()), dec.c_str());
+                ++n;
+            }
+            std::fprintf(stderr, "[VU1-Decode] %u Abbilder in %s dekodiert\n", n, dd);
+        });
+    }
     if (m_unit == Unit::VU1 && ps2x_vu1dump::dir() && memory && vuCode == memory->getVU1Code())
     {
         std::lock_guard<std::mutex> lk(ps2x_vu1dump::g_mutex);
@@ -2090,8 +2207,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             m_recGen = gen;
             const uint64_t recHash = ps2x_vu1dump::fnv(vuCode, codeSize);
-            m_recFn = vu1LookupCompiled(recHash);
-            m_recEntry = m_recFn ? vu1CompiledEntryMap(recHash) : nullptr;
+            // Erkennung ueber die Bytes der uebersetzten Paare (Signatur), nicht ueber den ganzen Mikrospeicher:
+            // derselbe Modulcode mit anderen Resten im Speicher bleibt erkannt
+            m_recFn = vu1CompiledMatch(vuCode, codeSize, recHash, &m_recEntry);
             m_recSkipPc = ~0u;
             if (!m_recFn)
             {

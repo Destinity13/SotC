@@ -44,7 +44,7 @@ pipeline in this repo turns *your* dump into *your* build on *your* machine (see
 | Open world, riding, climbing, save/load | ✅ | verified bit-exact vs. PCSX2 on recorded routes |
 | Sound & music (SPU2 + real IOP driver) | ✅ | |
 | Quit game / soft reset | ✅ / 🚧 | "New Game" from a running game untested |
-| Full-speed in colossus fights | 🚧 | first colossus reached and fought natively; VU1 code coverage gaps there fall back to the interpreter (being closed) |
+| Full-speed in colossus fights | 🚧 | all 21 VU1 programs of the game are now compiled ahead of time (statically, from the game files); play-test pending |
 | HD text | 🚧 | German pages of the intro/menus done, rest pending |
 | Settings menu, rumble, installer | ⬜ | planned |
 | Other regions (NTSC-U/J) | ⬜ | would need a new module layout |
@@ -114,6 +114,8 @@ over 7.26 million VU1 program invocations** and 36/36 regression screenshots are
 | Clip flags through a small in-block ring instead of the generic flag pipeline; VIF1 `UNPACK` specialised per format (no mask, CL/WL fast path — 176 M unpacks checked against the generic path) | 69.1 s | −17 % |
 | Profile-guided build of the above (`pc143`) | 63.1 s | −24 % |
 | Sticky status bits (`0xFC0`) dropped: a whole-program scan proves no VU1 program of this game ever reads them (all `FSAND` masks are `0x002`, `FMAND`/`FMEQ` read MAC, no `FCSET`) — without PGO | 59.0 s | **−29 %** |
+| Interpreter → compiled re-entry at the next block entry after a coverage gap (`pc149`) | – | colossus fix |
+| **All VU1 code compiled statically** (`pc154`): modules read from the game files, entries from each module's jump table and `MSCNT` continuations, reachability like PCSX2's microVU; programs recognised by a signature of exactly the bytes they compile, so leftovers of previously loaded modules no longer cause misses. 7,666 → **33,837** compiled instruction pairs, 11 → **21** programs | – | ✓ |
 | Tried and rejected: a leaner FMAC core with normalised register shadows ("stage 6") — correct, but 8–15 % *slower* (code size / spills) | 89.8–95.6 s | ✗ |
 
 Measured with the thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`), solo, same replay, no PGO noise.
@@ -237,7 +239,9 @@ All in `tools/`, all ours unless noted:
 | `extract_iso.py`, `scan_archive_xff.py`, `xff_symbols.py` | pull files and the resource index out of the disc; symbol tables from the XFF modules |
 | `link_sotc.py`, `verify_link.py`, `find_load_addresses.sh` | static linker for loader + XFF modules at fixed addresses, with placement report and stub generation for undefined externs |
 | `pipeline.sh`, `filter_stubs.py`, `find_missing_targets.py`, `gen_dyn_toml.py` | the ISO→C++ pipeline around the recompiler (two-pass, dynamic call sites, stub filtering) |
-| `vu1dump.py`, `vu1dis.py`, `vu1rec.py` | VU1 micro program dumper, disassembler and the ahead-of-time compiler (stages 1–5) |
+| `vu1dump.py`, `vu1dis.py`, `vu1rec.py` | VU1 micro program dumper, disassembler and the ahead-of-time compiler (stages 1–5); static reachability from module jump tables, signature-based program recognition, output split into 16 translation units |
+| `vu1_module.py` | Extracts every VU1 micro program module from the game's own files (VIF `MPG` upload chains in `MANAGER.XFF` of *your* dump) so all of them are compiled ahead of time — no play-through needed |
+| `vu1dump_merge.py` | Merges VU1 recordings (coverage union, module lengths) |
 | `pc_bauen_pgo.sh`, `build_game.sh`, `setup_cachyos.sh` | PGO build on the development machine, environment setup |
 | `sotc_worker.sh`, `sotc_bench.sh`, `sotc_test.sh`, `matrix.sh`, `auswerten.sh`, `sotc_test_report.py`, `sotc_dashboard.py`, `sotc_monitor.sh` | job queue: headless replay runs (up to 28 in parallel), experiment matrices, screenshot regression, HTML dashboard |
 | `pcsx2_nachspiel.py`, `pcsx2_fernbedienung.py`, `pcsx2_referenz.py` | drive PCSX2 with the same input recording (virtual pad via uinput, PINE socket, invisible compositor), take savestates at chosen frames |

@@ -26,7 +26,7 @@ def main():
             elif f.endswith(".cov"):
                 h = f[4:-4]
                 cov.setdefault(h, set()).update(x for x in open(p).read().split() if x)
-            elif (f.endswith(".bin") or f.endswith(".dec")) and f not in have:
+            elif (f.endswith(".bin") or f.endswith(".dec") or f.endswith(".len")) and f not in have:
                 shutil.copyfile(p, os.path.join(out, f))
                 have.add(f)
     for h, pcs in cov.items():

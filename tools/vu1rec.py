@@ -830,6 +830,16 @@ def main():
             continue
         covered = {int(x, 16) for x in open(cov).read().split()}
         pairs = [Pair(l) for l in open(dec) if l.strip()]
+        if os.environ.get("VU1REC_STATISCH", "1") == "1":
+            n0 = len(covered)
+            code0 = open(os.path.join(d, "vu1_%s.bin" % h), "rb").read()
+            tab = jump_table(code0)
+            START_PCS.setdefault(h, set()).update(tab)
+            lenf = os.path.join(d, "vu1_%s.len" % h)
+            modlen = int(open(lenf).read().split()[0]) if os.path.exists(lenf) else 0
+            covered = static_reach(pairs, covered | START_PCS.get(h, set()), modlen)
+            if len(covered) != n0:
+                print("  %s: statisch erreichbar %d Paare (Mitschnitt %d)" % (h, len(covered), n0))
         pairs = [p for p in pairs if p.pc in covered]
         # Liest ein tatsaechlich ausgefuehrter Befehl MAC/Status? (Der ganze Mikrospeicher enthaelt auch Reste
         # anderer Programme; die zaehlen nicht. Nicht abgedeckte Stellen schalten Flags beim Rueckfall wieder ein.)
@@ -844,6 +854,22 @@ def main():
             if (lo >> 25) in (0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B):
                 live = True
                 break
+        if STUFE >= 5 and any(not (p.lower >> 31) and (p.lower >> 25) == 0x11 for p in pairs):
+            print("  %s: enthaelt FCSET -> nicht uebersetzt (Clip-Ring bildet FCSET nicht nach), laeuft im Interpreter" % h)
+            continue
+        # Erkennungssignatur: die Bytes genau der uebersetzten Paare (Reste anderer Module im Speicher zaehlen nicht)
+        cset = sorted(p.pc for p in pairs)
+        rng = []
+        for pc in cset:
+            if rng and rng[-1][1] == pc:
+                rng[-1][1] = pc + 8
+            else:
+                rng.append([pc, pc + 8])
+        hv = 1469598103934665603
+        for a, b in rng:
+            for x in code[a:b]:
+                hv = ((hv ^ x) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        SIGS[h] = (rng, hv)
         progs.append((h, pairs, c, live))
     # Liest irgendein Programm die Sticky-Status-Bits (0xFC0)? Der Status bleibt zwischen Programmen erhalten,
     # deshalb ueber alle Programme. FSEQ vergleicht den ganzen Status -> braucht sie immer.
@@ -884,6 +910,8 @@ def main():
     w("#include <cstdlib>")
     w("#include <cstdio>")
     w("#include <cmath>")
+    w("#include <mutex>")
+    w("#include <unordered_map>")
     w("#include <limits>")
     w("#include <immintrin.h>")
     w("")
@@ -970,6 +998,63 @@ def main():
         w("    if (hash == 0x%sull) return s_entry_%s;" % (h, h))
     w("    return nullptr;")
     w("}")
+    # Erkennung ueber Signaturen: passt der Speicher in allen uebersetzten Bereichen, ist der Code gueltig, egal was
+    # sonst im Mikrospeicher steht (Reste vorher geladener Module, nachgeladene Teile)
+    for h, pairs, c, live in progs:
+        rng, hv = SIGS[h]
+        w("static const uint16_t s_rng_%s[] = {%s};" % (h, ",".join("%d,%d" % (a, b) for a, b in rng)))
+    w("struct Vu1Sig { uint64_t hash; uint64_t sig; const uint16_t *rng; uint32_t nrng; VU1Interpreter::CompiledFn fn; const uint8_t *entry; };")
+    w("static const Vu1Sig s_sigs[] = {")
+    for h, pairs, c, live in progs:
+        rng, hv = SIGS[h]
+        w("    {0x%sull, 0x%016xull, s_rng_%s, %du, &VU1Interpreter::Compiled::run_%s, s_entry_%s}," % (h, hv, h, len(rng), h, h))
+    w("};")
+    w("extern VU1Interpreter::CompiledFn vu1CompiledMatch(const uint8_t *code, uint32_t size, uint64_t whole, const uint8_t **entry)")
+    w("{")
+    w("    static std::mutex m; static std::unordered_map<uint64_t, const Vu1Sig *> cache;")
+    w("    std::lock_guard<std::mutex> lk(m);")
+    w("    auto it = cache.find(whole);")
+    w("    const Vu1Sig *hit = nullptr;")
+    w("    if (it != cache.end()) hit = it->second;")
+    w("    else")
+    w("    {")
+    w("        for (const Vu1Sig &s : s_sigs) if (s.hash == whole) { hit = &s; break; }")
+    w("        if (!hit)")
+    w("            for (const Vu1Sig &s : s_sigs)")
+    w("            {")
+    w("                uint64_t h = 1469598103934665603ull; bool fits = true;")
+    w("                for (uint32_t k = 0; k < s.nrng && fits; ++k)")
+    w("                {")
+    w("                    const uint32_t a = s.rng[2 * k], b = s.rng[2 * k + 1];")
+    w("                    if (b > size) { fits = false; break; }")
+    w("                    for (uint32_t i = a; i < b; ++i) { h ^= code[i]; h *= 1099511628211ull; }")
+    w("                }")
+    w("                if (fits && h == s.sig) { hit = &s; break; }")
+    w("            }")
+    w("        cache.emplace(whole, hit);")
+    w("        if (hit && hit->hash != whole) std::fprintf(stderr, \"[VU1-Rec] Speicherabbild %016llx -> uebersetztes Programm %016llx (Signatur)\\n\", (unsigned long long)whole, (unsigned long long)hit->hash);")
+    w("    }")
+    w("    if (entry) *entry = hit ? hit->entry : nullptr;")
+    w("    return hit ? hit->fn : nullptr;")
+    w("}")
+    teile = int(os.environ.get("VU1REC_TEILE", "0"))
+    if teile > 0:
+        # Aufteilen fuer paralleles Kompilieren: Vorspann (Klasse, Helfer) in jede Teildatei, die run_-Funktionen
+        # reihum auf VU1REC_TEILE Dateien, Tabellen in die Hauptdatei. Immer alle Teile schreiben (keine Altlasten).
+        starts = [k for k, l in enumerate(out) if l.startswith("int VU1Interpreter::Compiled::run_")]
+        tail = next(k for k, l in enumerate(out) if l.startswith("extern const VU1Interpreter::CompiledEntry g_vu1CompiledTable"))
+        pre = [l.replace("void VU1Interpreter::Compiled::FlagRing::apply(", "inline void VU1Interpreter::Compiled::FlagRing::apply(") for l in out[:starts[0]]] if starts else out[:tail]
+        bodies = [out[a:b] for a, b in zip(starts, starts[1:] + [tail])]
+        groups = [[] for _ in range(teile)]
+        for i, b in enumerate(sorted(bodies, key=len, reverse=True)):
+            min(groups, key=lambda g: sum(len(x) for x in g)).append(b)  # nach Groesse verteilen
+        for t, g in enumerate(groups):
+            with open(outp.replace(".cpp", "_t%02d.cpp" % t), "w") as fo:
+                fo.write("// Teil %d von %d (tools/vu1rec.py, VU1REC_TEILE)\n" % (t, teile))
+                fo.write("\n".join(pre) + "\n")
+                for b in g:
+                    fo.write("\n".join(b) + "\n")
+        out = pre + out[tail:]
     open(outp, "w").write("\n".join(out) + "\n")
     print("%d Programme, %d Paare -> %s" % (len(progs), sum(len(p) for _, p, _, _ in progs), outp))
 
@@ -983,6 +1068,77 @@ def main():
 BR_STATIC = {0x20: "B", 0x21: "BAL", 0x28: "IBEQ", 0x29: "IBNE", 0x2C: "IBLTZ", 0x2D: "IBGTZ", 0x2E: "IBLEZ", 0x2F: "IBGEZ"}
 BR_DYN = {0x24: "JR", 0x25: "JALR"}
 FLAG_READERS = {0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B}
+
+def jump_table(code):
+    """Sprungtabelle am Modulanfang (SotC: je 16 Byte 'B ziel' + NOP-Paar, Luecken mit NOP/NOP gefuellt).
+    Ihre Eintraege sind die Startadressen, die das Spiel per MSCAL benutzt."""
+    out = [0]
+    pc = 0
+    while pc + 16 <= min(len(code), 0x800):
+        lo, up = struct.unpack_from("<II", code, pc)
+        lo2, up2 = struct.unpack_from("<II", code, pc + 8)
+        nop2 = (up2 & 0x3F) == 0x3F and (up2 >> 27) == 0 and (lo2 == 0x8000033C or lo2 == 0)
+        if (lo >> 31) == 0 and ((lo >> 25) & 0x7F) == 0x20 and nop2 and (up >> 27) == 0:
+            out.append(pc)
+        elif (lo == 0x8000033C or lo == 0) and (up & 0x3F) == 0x3F and (up >> 27) == 0 and nop2:
+            pass  # Fuellpaare
+        else:
+            break
+        pc += 16
+    return out
+
+def static_reach(pairs, seeds, modlen=0):
+    """Wie microVU: alle von bekannten Einstiegen aus erreichbaren Paare (beide Seiten bedingter Spruenge, Sprungziele,
+    Ruecksprungadressen von BAL/JALR). Ziele von JR/JALR sind dynamisch: dafuer gelten alle Ruecksprungadressen und die
+    Einstiege des Mitschnitts; was dann noch fehlt, faengt der Wiedereinstieg zur Laufzeit ab. Am Programmende (E-Bit)
+    wird nur das Verzoegerungspaar mitgenommen; der Code dahinter zaehlt erst, wenn er als Einstieg bekannt ist."""
+    bypc = {p.pc: p for p in pairs}
+    def ok(pc):
+        p = bypc.get(pc)
+        return p is not None and not (p.uu.reserved or p.lu.reserved)
+    ret = set()
+    for p in pairs:
+        c = lower_ctrl(p)
+        if c and c[1] in ("BAL", "JALR"):
+            ret.add((p.pc + 16) & 0x3FFF)
+    seen = set()
+    work = [x for x in seeds if ok(x)]
+    retAdded = False
+    while work:
+        pc = work.pop()
+        while ok(pc) and pc not in seen:
+            seen.add(pc)
+            p = bypc[pc]
+            c = lower_ctrl(p)
+            slot = (pc + 8) & 0x3FFF
+            if p.eBit:
+                if ok(slot): seen.add(slot)
+                # Fortsetzung per MSCNT direkt hinter dem Verzoegerungspaar (Doppelpufferung: anhalten, weiter);
+                # nur innerhalb der bekannten Modullaenge, sonst koennten Reste anderer Module in die Signatur geraten
+                cont = (pc + 16) & 0x3FFF
+                if modlen and cont < modlen:
+                    work.append(cont)
+                break
+            if c:
+                if ok(slot) and slot not in seen:
+                    seen.add(slot)
+                    sp = bypc[slot]
+                    if sp.eBit or lower_ctrl(sp):
+                        pass  # Sprung im Verzoegerungspaar: Spiel macht das nicht, Rest faengt der Wiedereinstieg ab
+                after = (pc + 16) & 0x3FFF
+                if c[0] == "static":
+                    work.append(c[2])
+                    if c[1] not in ("B",):
+                        work.append(after)  # bedingt: nicht genommen; BAL: Ruecksprung
+                else:
+                    if c[1] == "JALR":
+                        work.append(after)
+                    if not retAdded:
+                        work.extend(ret); retAdded = True
+                break
+            pc = slot
+    # Vorsicht: nur behalten, was mit dem Mitschnitt verbunden ist (Seeds sind sicher ausgefuehrt worden)
+    return seen
 
 def lower_ctrl(d):
     """('static', name, target) / ('dyn', name, None) / None"""
@@ -1121,6 +1277,7 @@ CUR_PC = -1
 ENTRIES5 = set()
 BACKUP_SETTERS = set()
 START_PCS = {}  # hash -> Startadressen (vu1_index.txt)
+SIGS = {}  # hash -> (Bereiche, FNV der Bytes darin)
 ENTRY_MAPS = {}  # hash -> Einstiege (fuer den Wiedereinstieg aus dem Interpreter)
 
 def needs_vf0_reset(d):

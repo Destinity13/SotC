@@ -394,6 +394,22 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_compiled.cpp
+    src/lib/vu/ps2_vu1_compiled_t00.cpp
+    src/lib/vu/ps2_vu1_compiled_t01.cpp
+    src/lib/vu/ps2_vu1_compiled_t02.cpp
+    src/lib/vu/ps2_vu1_compiled_t03.cpp
+    src/lib/vu/ps2_vu1_compiled_t04.cpp
+    src/lib/vu/ps2_vu1_compiled_t05.cpp
+    src/lib/vu/ps2_vu1_compiled_t06.cpp
+    src/lib/vu/ps2_vu1_compiled_t07.cpp
+    src/lib/vu/ps2_vu1_compiled_t08.cpp
+    src/lib/vu/ps2_vu1_compiled_t09.cpp
+    src/lib/vu/ps2_vu1_compiled_t10.cpp
+    src/lib/vu/ps2_vu1_compiled_t11.cpp
+    src/lib/vu/ps2_vu1_compiled_t12.cpp
+    src/lib/vu/ps2_vu1_compiled_t13.cpp
+    src/lib/vu/ps2_vu1_compiled_t14.cpp
+    src/lib/vu/ps2_vu1_compiled_t15.cpp
     src/lib/games_database.cpp
 )
 
